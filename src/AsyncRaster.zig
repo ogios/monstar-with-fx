@@ -68,6 +68,10 @@ pub const Job = struct {
     /// data repointed at cache-pinned copies; empty when no graphics are
     /// visible.
     kitty_items: []const Renderer.KittyRenderItem,
+    /// Animated cursor quad. Unlike the padding-drawing overlays it stays
+    /// inside the grid rows, so a cursor-only frame still runs the
+    /// partial-repair path, repainting only the crossed rows.
+    cursor_overlay: ?Renderer.CursorOverlay = null,
     /// Any overlay input (kitty snapshot, preedit, link hint, hint
     /// flag) differs from the previously submitted job. Unchanged
     /// overlays over clean content need no repaint.
@@ -477,6 +481,7 @@ fn workerMain(self: *AsyncRaster) void {
         self.renderer.search_matches = job.search_matches;
         self.renderer.search_bg = job.search_background;
         self.renderer.search_fg = job.search_foreground;
+        self.renderer.cursor_overlay = job.cursor_overlay;
         self.renderer.buffer_stride = job.width;
         var damage: Damage = .full;
         const maybe_err: ?anyerror = if (self.renderJob(job, &damage)) |_| null else |e| e;
@@ -491,8 +496,13 @@ fn workerMain(self: *AsyncRaster) void {
 
 fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     const grid_pixels = gridPixels(job);
-    // Overlays draw outside the grid rows that dirty tracking accounts
-    // for, so an overlay frame is always a full render with full damage.
+    // Include the old quad when animation ends so partial repair erases it.
+    if ((job.cursor_overlay != null or self.renderer.last_cursor_quad != null) and
+        !job.hasOverlay() and job.scroll_offset == 0 and self.state.dirty != .full)
+    {
+        return self.renderJobCursor(job, grid_pixels, damage);
+    }
+    // Padding overlays and fractional scrolling require a full repaint.
     if (job.hasOverlay() or job.scroll_offset != 0) {
         // Unless nothing changed at all: clean content plus the same
         // overlays as the previous job reproduce the previous frame,
@@ -587,6 +597,75 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
             damage.* = .none;
         },
     }
+}
+
+/// Partial-repair path for a cursor-only animated overlay. Forces a repaint
+/// of the rows the cursor quad (old and new) crossed so its vacated trail is
+/// cleared, then composites the new quad. The rest of the grid is untouched,
+/// so damage is limited to those rows instead of the whole surface.
+fn renderJobCursor(self: *AsyncRaster, job: Job, grid_pixels: []u32, damage: *Damage) !void {
+    if (self.state.rows == 0 or self.state.cols == 0) {
+        damage.* = .none;
+        return;
+    }
+    const force = self.cursorForceRows();
+    self.renderer.cursor_force_row_min = force[0];
+    self.renderer.cursor_force_row_max = force[1];
+    defer {
+        self.renderer.cursor_force_row_min = std.math.maxInt(usize);
+        self.renderer.cursor_force_row_max = 0;
+    }
+    if (!repairToPreviousFrame(job)) {
+        clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
+        try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
+        damage.* = .full;
+        return;
+    }
+    try self.renderer.renderDirty(self.state, grid_pixels, job.grid_width, job.grid_height);
+    if (self.renderer.rendered_rects.items.len == 0) {
+        damage.* = .none;
+        return;
+    }
+    // multi_row_overhang: renderDirty wholesale re-renders, which already
+    // composites the overlay; drawing it again would double-draw the glyph.
+    if (!self.font.multi_row_overhang) {
+        try self.renderer.renderCursorOverlay(self.state, grid_pixels, job.grid_width, job.grid_height);
+    }
+    damage.* = .partial;
+}
+
+/// Inclusive grid-local row band (expanded one row for glyph overhang) that
+/// the current and previous cursor quads crossed, so renderDirty can clear
+/// both the leading edge and the trail. `min > max` forces nothing.
+fn cursorForceRows(self: *AsyncRaster) [2]usize {
+    if (self.state.rows == 0) return .{ std.math.maxInt(usize), 0 };
+    const cell_h: usize = self.font.cell_height;
+    const rows: usize = self.state.rows;
+    var min_row: usize = std.math.maxInt(usize);
+    var max_row: usize = 0;
+    var found = false;
+    const candidates = [_]?Renderer.CursorOverlay{ self.renderer.cursor_overlay, self.renderer.last_cursor_quad };
+    for (candidates) |overlay| {
+        const quad = overlay orelse continue;
+        for (quad.corners) |corner| {
+            const row: usize = if (corner[1] <= 0)
+                0
+            else
+                @min(rows - 1, @as(usize, @intCast(@divTrunc(corner[1], @as(i32, @intCast(cell_h))))));
+            if (!found) {
+                min_row = row;
+                max_row = row;
+                found = true;
+            } else {
+                min_row = @min(min_row, row);
+                max_row = @max(max_row, row);
+            }
+        }
+    }
+    if (!found) return .{ std.math.maxInt(usize), 0 };
+    min_row -|= 1;
+    max_row = @min(rows - 1, max_row + 1);
+    return .{ min_row, max_row };
 }
 
 fn gridPixels(job: Job) []u32 {
