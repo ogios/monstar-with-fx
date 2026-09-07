@@ -19,6 +19,7 @@ const vt = @import("ghostty-vt");
 const Clipboard = @import("Clipboard.zig");
 const KittyClipboard = @import("KittyClipboard.zig");
 const Config = @import("Config.zig");
+const CursorAnimator = @import("CursorAnimator.zig");
 const keybind = @import("keybind.zig");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
@@ -142,6 +143,16 @@ copy_highlight_active: bool,
 cursor_color: Config.TerminalColor,
 /// Configured text color beneath a focused block cursor.
 cursor_text: ?Config.TerminalColor,
+/// Neovide-style animated cursor. Owns the gliding corners; a non-settled
+/// animator repaints the cursor overlay in lockstep with the compositor.
+cursor_anim: CursorAnimator.Animator = undefined,
+/// False until the first recognized cursor destination has been seeded.
+cursor_anim_ready: bool = false,
+/// True while the cursor quad is in motion; detects the settle handoff
+/// back to the native cell cursor so that cell repaints in cursor colors.
+cursor_anim_moving: bool = false,
+/// Monotonic time (ns) of the previous cursor-animation advance, for dt.
+cursor_anim_last_ns: u64 = 0,
 window: *Window,
 keyboard: Keyboard,
 /// Terminal contents changed since the last committed frame.
@@ -687,6 +698,10 @@ pub fn init(
         .copy_highlight_active = false,
         .cursor_color = config.effectiveCursorColor(.dark),
         .cursor_text = config.effectiveCursorText(.dark),
+        .cursor_anim = undefined,
+        .cursor_anim_ready = false,
+        .cursor_anim_moving = false,
+        .cursor_anim_last_ns = 0,
         .window = window,
         .keyboard = try .init(),
         .needs_redraw = true,
@@ -1790,6 +1805,13 @@ pub fn run(self: *App) !void {
             self.readClipboardTransfer();
         }
 
+        // Drive the cursor trail in lockstep with the compositor: each frame
+        // callback clears frame_pending, and re-arming the redraw here samples
+        // exactly one trail step per displayed frame at the monitor's refresh
+        // rate rather than on the old fixed timer.
+        if (self.cursor_anim_moving and !self.window.frame_pending and !self.window.suspended) {
+            self.needs_redraw = true;
+        }
         try self.redrawIfNeeded();
     }
 
@@ -5817,6 +5839,16 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         old_cursor = self.render_state.cursor;
         try self.render_state.update(self.alloc, &self.term);
         self.dirtyCursorRows(old_cursor);
+        const cursor_was_animating = self.cursor_anim_moving;
+        self.syncCursorAnimator();
+        // Advance the trail once per produced frame so it stays locked to the
+        // compositor's refresh rather than sampling on a fixed nanosecond
+        // timer. Guard on readiness and on an active or pending jump: with no
+        // movement the animator is disabled/unsupported and advance() would
+        // read an uninitialized quad.
+        if (self.cursor_anim_ready and (self.cursor_anim_moving or self.cursor_anim.jumped)) {
+            self.advanceCursorAnimation(cursor_was_animating);
+        }
         // If terminal state (rather than the fade timer) removed the last
         // overlay, redraw its old pixels instead of repairing from a buffer
         // that still contains the thumb.
@@ -5868,13 +5900,19 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             self.render_state.dirty = .full;
         }
         overlay_dirty = overlay_dirty or kitty_changed;
+        const new_cursor_overlay = self.cursorOverlay();
+        if (!std.meta.eql(self.async_job.cursor_overlay, new_cursor_overlay))
+            overlay_dirty = true;
+        self.async_job.setCursorOverlay(new_cursor_overlay);
         if (overlay_dirty or self.render_state.dirty != .full) scroll = null;
         // Nothing to draw: content is clean and every overlay input
         // matches the previous job. Parse batches that only stream
         // kitty payload bytes land here; submitting would burn a job
         // round-trip (and often a buffer repair copy) on a frame
-        // identical to the last one.
-        if (self.render_state.dirty == .false and !overlay_dirty and !self.geometry_redraw) return .no_work;
+        // identical to the last one. A moving cursor trail is exempt:
+        // it must keep a frame callback outstanding so it never freezes
+        // mid-settle (its integer-rounded corner is momentarily stable).
+        if (self.render_state.dirty == .false and !overlay_dirty and !self.geometry_redraw and !self.cursor_anim_moving) return .no_work;
     } else {
         // Keep link affordances consistent with the stale snapshot.
         hyperlink_hints = self.async_job.hyperlink_hints;
@@ -5882,6 +5920,10 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         // Remove the thumb while synchronized output holds the old terminal
         // snapshot; the current geometry is picked up when the freeze ends.
         if (self.async_job.scrollbar != null) self.render_state.dirty = .full;
+        if (self.async_job.cursor_overlay != null) {
+            self.async_job.cursor_overlay = null;
+            self.render_state.dirty = .full;
+        }
     }
     std.debug.assert(self.held_frame == null);
     const target = self.window.acquireRenderTarget() catch |err| {
@@ -5940,6 +5982,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         .search_no_match = self.async_job.search_no_match,
         .scrollbar = if (frozen) null else self.async_job.scrollbar,
         .kitty_items = self.async_job.kitty,
+        .cursor_overlay = self.async_job.cursor_overlay,
         .overlay_dirty = overlay_dirty,
         .scroll_shift = if (scroll) |value| value.shift else null,
         .repair = repair,
@@ -6265,6 +6308,154 @@ fn dirtyCursorRowInState(state: *vt.RenderState, viewport: ?vt.RenderState.Curso
 
     state.row_data.items(.dirty)[row.y] = true;
     if (state.dirty == .false) state.dirty = .partial;
+}
+
+/// Mark the current cursor viewport row dirty so the native cell cursor
+/// repaints in its colors (used on settle handoff from the overlay).
+fn dirtyCursorCell(self: *App) void {
+    dirtyCursorRowInState(&self.render_state, self.render_state.cursor.viewport);
+}
+
+/// Whether the animated cursor should be active right now. Disabled by
+/// the config flag, reduced-motion, lost focus, or a hidden cursor.
+fn cursorAnimationEnabled(self: *const App) bool {
+    if (!self.config.cursor_animation) return false;
+    if (self.reduced_motion) return false;
+    if (!self.focused) return false;
+    if (!self.render_state.cursor.visible) return false;
+    return true;
+}
+
+fn cursorAnimatorSettings(self: *const App) CursorAnimator.Settings {
+    return .{
+        .animation_length = @as(f32, @floatFromInt(self.config.cursor_animation_length)) / 1000.0,
+        .short_animation_length = @as(f32, @floatFromInt(self.config.cursor_animation_short)) / 1000.0,
+        .trail_size = @as(f32, @floatFromInt(self.config.cursor_animation_trail)) / 100.0,
+    };
+}
+
+fn cursorAnimatorShape(self: *const App) CursorAnimator.Shape {
+    return switch (self.render_state.cursor.visual_style) {
+        .bar => .bar,
+        .underline => .underline,
+        .block_hollow => .hollow,
+        .block => .block,
+    };
+}
+
+/// The grid-pixel destination (top-left) of the cursor cell.
+fn cursorAnimatorDestination(self: *const App) ?[2]f32 {
+    const viewport = self.render_state.cursor.viewport orelse return null;
+    const x: u31 = @intCast(viewport.x -| @intFromBool(viewport.wide_tail));
+    const y: u31 = viewport.y;
+    return .{
+        @as(f32, @floatFromInt(x * self.font.cell_width)),
+        @as(f32, @floatFromInt(y * self.font.cell_height)),
+    };
+}
+
+/// Whether the cursor sits on a wide character, doubling the block width.
+fn cursorAnimatorDoubleWidth(self: *const App) bool {
+    const viewport = self.render_state.cursor.viewport orelse return false;
+    if (viewport.wide_tail) return true;
+    const cell = self.render_state.cursor.cell;
+    return cell.wide == .wide;
+}
+
+/// Reconcile the animator to the terminal's current cursor cell after each
+/// render-state update. Retargets when the cursor moved; initializes the
+/// animator on the first call; flags movement (the trail then advances per
+/// produced frame in lockstep with the compositor).
+fn syncCursorAnimator(self: *App) void {
+    if (!self.cursorAnimationEnabled()) {
+        if (self.cursor_anim_moving) {
+            self.cursor_anim_moving = false;
+            self.dirtyCursorCell();
+        }
+        if (self.cursor_anim_ready) {
+            // Snap the animator to its destination so a stale quad does not
+            // linger when the cursor is hidden/unfocused.
+            const destination = self.cursorAnimatorDestination() orelse .{ 0, 0 };
+            self.cursor_anim.setDestination(
+                destination,
+                .{ @floatFromInt(self.font.cell_width), @floatFromInt(self.font.cell_height) },
+                self.cursorAnimatorDoubleWidth(),
+                self.cursorAnimatorSettings(),
+                true,
+            );
+        }
+        return;
+    }
+
+    const destination = self.cursorAnimatorDestination() orelse return;
+    const dims = [2]f32{
+        @as(f32, @floatFromInt(self.font.cell_width)),
+        @as(f32, @floatFromInt(self.font.cell_height)),
+    };
+    const double_width = self.cursorAnimatorDoubleWidth();
+    const shape = self.cursorAnimatorShape();
+
+    if (!self.cursor_anim_ready) {
+        self.cursor_anim = CursorAnimator.Animator.init(shape, dims, double_width, destination);
+        self.cursor_anim_ready = true;
+        return;
+    }
+
+    if (self.cursor_anim.shape != shape) {
+        self.cursor_anim.setShape(shape, dims, double_width);
+    }
+    self.cursor_anim.setDestination(destination, dims, double_width, self.cursorAnimatorSettings(), false);
+    if (!self.cursor_anim.settled()) {
+        self.cursor_anim_moving = true;
+    }
+}
+
+/// Current animated cursor quad, or null when the animator is at rest
+/// (so the renderer's native cell cursor takes over).
+fn cursorOverlay(self: *const App) ?Renderer.CursorOverlay {
+    if (!self.cursorAnimationEnabled()) return null;
+    if (!self.cursor_anim_ready) return null;
+    // The overlay fills a filled quad; a hollow block must stay the native
+    // outlined sprite, so it does not animate.
+    if (self.cursor_anim.shape == .hollow) return null;
+    if (self.cursor_anim.settled()) return null;
+    const corners = self.cursor_anim.cursorCorners();
+    return .{
+        .corners = .{
+            .{ @intFromFloat(corners[0][0]), @intFromFloat(corners[0][1]) },
+            .{ @intFromFloat(corners[1][0]), @intFromFloat(corners[1][1]) },
+            .{ @intFromFloat(corners[2][0]), @intFromFloat(corners[2][1]) },
+            .{ @intFromFloat(corners[3][0]), @intFromFloat(corners[3][1]) },
+        },
+        .shape = self.cursor_anim.shape,
+    };
+}
+
+/// Advance the cursor trail once per produced frame. From rest the first
+/// step takes no elapsed time (so a fresh jump glides from the next frame),
+/// while an already-moving trail folds in the whole frame period — keeping
+/// the trail's sampling rate equal to the compositor's refresh rate.
+fn advanceCursorAnimation(self: *App, was_animating: bool) void {
+    const now_ns = self.nowNs();
+    if (!was_animating) self.cursor_anim_last_ns = now_ns;
+    const dt_sec = @as(f32, @floatFromInt(now_ns -| self.cursor_anim_last_ns)) / @as(f32, std.time.ns_per_s);
+    self.cursor_anim_last_ns = now_ns;
+    const clamped = std.math.clamp(dt_sec, 0.0, 0.05);
+    if (self.cursor_anim.advance(clamped)) {
+        self.cursor_anim_moving = true;
+    } else {
+        // Settled: hand off to the native cell cursor, repainting its cell
+        // in cursor colors (the overlay no longer covers it).
+        if (self.cursor_anim_moving) {
+            self.cursor_anim_moving = false;
+            self.dirtyCursorCell();
+        }
+    }
+}
+
+fn nowNs(self: *const App) u64 {
+    const ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+    return @intCast(@max(ns, 0));
 }
 
 fn clearRenderDirty(self: *App) void {

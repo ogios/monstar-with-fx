@@ -41,7 +41,17 @@ const blendCapsule = pixel_raster.blendCapsule;
 const blendPixel = pixel_raster.blendPixel;
 const blendRgb = pixel_raster.blendRgb;
 const blitGlyph = pixel_raster.blitGlyph;
+const fillQuad = pixel_raster.fillQuad;
 const fillRect = pixel_raster.fillRect;
+
+/// An animated (Neovide-style) cursor drawn as a convex quad after the
+/// grid rows. Corners are top-left, top-right, bottom-right, bottom-left
+/// in grid pixel space. A fourth corner being sheared by independent
+/// springs gives the leading-edge/trailing-edge stretch.
+pub const CursorOverlay = struct {
+    corners: [4][2]i32,
+    shape: @import("CursorAnimator.zig").Shape,
+};
 
 alloc: std.mem.Allocator,
 font: *Font,
@@ -58,6 +68,21 @@ cursor_color: ?Config.TerminalColor,
 /// Explicit text color under a focused block cursor. Null preserves the
 /// terminal background fallback.
 cursor_text: ?Config.TerminalColor,
+/// Animated cursor quad drawn over the grid after rows are rendered.
+/// When set, the block cursor is NOT recolored in the cell pass — the
+/// overlay handles both the fill and the glyph recolor, so a gliding
+/// cursor correctly smears across intermediate cells.
+cursor_overlay: ?CursorOverlay = null,
+/// Inclusive grid-local row band that must be repainted alongside the
+/// dirty rows before the cursor overlay is composited, clearing the
+/// cells a gliding cursor vacated. `min > max` means no forced rows.
+/// Set by the cursor overlay's partial-render path.
+cursor_force_row_min: usize = std.math.maxInt(usize),
+cursor_force_row_max: usize = 0,
+/// The cursor quad drawn by the previous frame, so the next partial
+/// cursor render can repaint the rows it vacated. Cleared when the
+/// overlay is not drawn (settled or native cursor).
+last_cursor_quad: ?CursorOverlay = null,
 /// Alpha applied to the default terminal background and window padding.
 background_alpha: u8,
 /// Whether background alpha also applies to explicit terminal cell
@@ -301,6 +326,7 @@ pub fn render(
             self.backgroundPixel(state.colors.background),
         );
     }
+    try self.renderCursorOverlay(state, pixels, width, height);
     if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
 }
 
@@ -381,6 +407,7 @@ pub fn renderWithKittyItems(
     }
 
     try self.renderKittyItems(items, pixels, width, height, .above_text);
+    try self.renderCursorOverlay(state, pixels, width, height);
     if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
 }
 
@@ -420,9 +447,10 @@ pub fn renderDirty(
     const all_selections = rows.items(.selection);
     const all_dirty = rows.items(.dirty);
     var rendered_until: usize = 0;
-    for (all_dirty[0..state.rows], 0..) |dirty, y| {
-        if (!dirty) continue;
-        if (self.partial_cell_raster and self.cell_damage_tracker.damageForRow(y) == null) continue;
+    for (0..state.rows) |y| {
+        const is_forced = self.cursorForceRow(y);
+        if (!all_dirty[y] and !is_forced) continue;
+        if (self.partial_cell_raster and !is_forced and self.cell_damage_tracker.damageForRow(y) == null) continue;
         const expand_up = y > 0 and
             (self.font.neighbor_row_overhang or self.row_overhang.isSet(y));
         const expand_down = y + 1 < state.rows and
@@ -431,7 +459,7 @@ pub fn renderDirty(
         const end = y + 1 + @intFromBool(expand_down);
         var row = @max(start, rendered_until);
         while (row < end) : (row += 1) {
-            const cell_damage = if (self.partial_cell_raster and
+            const cell_damage = if (self.partial_cell_raster and !is_forced and
                 row == y and start == y and end == y + 1)
                 self.cell_damage_tracker.damageForRow(y)
             else
@@ -463,6 +491,15 @@ pub fn renderDirty(
         }
         rendered_until = @max(rendered_until, end);
     }
+}
+
+/// Whether `y` falls in the cursor force-row band. The band repaints the
+/// rows a gliding cursor quad crossed so its vacated pixels are cleared
+/// before the new quad is composited on top. A band wider than the grid
+/// rows (min > max) forces nothing.
+fn cursorForceRow(self: *const Renderer, y: usize) bool {
+    return self.cursor_force_row_min <= self.cursor_force_row_max and
+        y >= self.cursor_force_row_min and y <= self.cursor_force_row_max;
 }
 
 fn recordRenderedRect(
@@ -714,6 +751,99 @@ pub fn renderLinkHint(
         .bottom_left,
         self.selection_bg,
         self.selection_fg orelse state.colors.foreground,
+    );
+}
+
+/// Draw the animated cursor quad over the rendered grid. The quad is
+/// filled with the cursor background color; for a focused block cursor the
+/// destination cell's glyph is re-blitted in the cursor text color so the
+/// character stays readable under the sliding block. Bar/underline/hollow
+/// shapes only need the filled quad (the text underneath remains visible).
+pub fn renderCursorOverlay(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+) !void {
+    // Remember the quad just drawn so the next partial cursor render can
+    // repaint the rows it vacated. Clearing to null when the overlay is
+    // absent lets a settle/full frame drop stale force rows.
+    self.last_cursor_quad = self.cursor_overlay;
+    const overlay = self.cursor_overlay orelse return;
+    if (!state.cursor.visible) return;
+    const colors = &state.colors;
+    const cursor = state.cursor;
+
+    const cell = cursorCellRgb(cursor.style, &cursor.cell, colors);
+    const fill = self.cursorFill(colors, cell.fg, cell.bg);
+    const text = self.cursorGlyph(colors, cell.fg, cell.bg);
+
+    const corners = overlay.corners;
+    fillQuad(pixels, self.pixelStride(width), width, height, corners, argb(fill));
+
+    // Only a focused block cursor recolors the glyph underneath; bar and
+    // underline keep their cell text untouched.
+    if (overlay.shape != .block or !self.focused) return;
+
+    const viewport = cursor.viewport orelse return;
+    const x: u31 = @intCast(viewport.x -| @intFromBool(viewport.wide_tail));
+    const y: u31 = viewport.y;
+    if (y >= state.rows) return;
+    const rows = state.row_data.slice();
+    const row_cells = rows.items(.cells)[y];
+    if (x >= row_cells.len) return;
+
+    // Clip the glyph to the quad's horizontal extent so a partially
+    // covered destination cell shows text only within the block.
+    const quad_min_x = @as(i32, @intCast(@min(corners[0][0], corners[1][0])));
+    const quad_max_x = @as(i32, @intCast(@max(corners[2][0], corners[3][0])));
+    const prev_clip = self.glyph_clip_x;
+    self.glyph_clip_x = .{
+        .start = @max(0, quad_min_x),
+        .end = quad_max_x,
+    };
+    defer self.glyph_clip_x = prev_clip;
+
+    const raw = row_cells.items(.raw)[x];
+    const cp = glyph_constraints.cellCodepoint(raw);
+    if (cp == 0 or cp == kitty_placeholder) return;
+    const span: u31 = @min(2, glyph_constraints.cellSpan(raw));
+    const face_idx = self.font.faceForCodepoint(self.alloc, cp);
+    const baseline_y: i32 = @as(i32, y) * self.font.cell_height + self.font.baseline;
+    if (face_idx == Font.sprite_face_index) {
+        const g = try self.font.spriteGlyph(self.alloc, cp, @intCast(span));
+        self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
+        blitGlyph(
+            pixels,
+            self.pixelStride(width),
+            width,
+            height,
+            g,
+            @as(i32, @intCast(x)) * self.font.cell_width + g.bearing_x,
+            baseline_y - g.bearing_y,
+            argb(text),
+            false,
+            self.glyph_clip_x,
+        );
+        return;
+    }
+    const face = self.font.face(face_idx);
+    const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+    if (glyph_idx == 0) return;
+    const g = try face.glyph(self.alloc, glyph_idx, @intCast(span), glyph_constraints.isSymbol(cp));
+    self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
+    blitGlyph(
+        pixels,
+        self.pixelStride(width),
+        width,
+        height,
+        g,
+        @as(i32, @intCast(x)) * self.font.cell_width + g.bearing_x,
+        baseline_y - g.bearing_y,
+        argb(text),
+        false,
+        self.glyph_clip_x,
     );
 }
 
@@ -1431,8 +1561,11 @@ fn prepareRowCells(
         // after the cell backgrounds so it can retain the font's natural
         // height when the cell height is adjusted. All other cursor shapes
         // (and any unfocused cursor) overlay a sprite after drawing instead.
+        // When an animated cursor overlay is active it owns both fill and
+        // recolor, so the cell itself stays in its normal colors.
         if (cursor_x != null and cursor_x.? == x and
-            state.cursor.visual_style == .block and self.focused)
+            state.cursor.visual_style == .block and self.focused and
+            self.cursor_overlay == null)
         {
             const cell = cursorCellRgb(style, &raws[x], colors);
             fg = self.cursorGlyph(colors, cell.fg, cell.bg);
@@ -1655,8 +1788,10 @@ fn renderRowForegroundCells(
 
     // Non-block cursor shapes (DECSCUSR bar/underline, hollow block)
     // overlay the cell rather than recoloring it. Without keyboard
-    // focus the cursor is always a hollow rectangle.
+    // focus the cursor is always a hollow rectangle. When an animated
+    // cursor overlay is active it owns the shape, so skip the sprite.
     if (cursor_x) |cx| cursor: {
+        if (self.cursor_overlay != null) break :cursor;
         if (cx < range_start or cx >= range_end) break :cursor;
         const kind: ?@import("sprite.zig").Decoration = if (!self.focused)
             .cursor_hollow_rect
@@ -2648,6 +2783,51 @@ test "focused block cursor keeps natural height in an expanded cell" {
         argb(state.colors.foreground),
         pixels[@as(usize, 2) * width + x],
     );
+}
+
+test "cursor overlay fills the quad with the cursor color" {
+    const alloc = std.testing.allocator;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{
+        .cursor_color = .cell_foreground,
+    });
+    defer renderer.deinit();
+
+    const width = font.cell_width * 2;
+    const height = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    const cw: i32 = @intCast(font.cell_width);
+    const ch: i32 = @intCast(font.cell_height);
+    // A block cursor spanning the first cell.
+    renderer.cursor_overlay = .{
+        .corners = .{
+            .{ 0, 0 },
+            .{ cw, 0 },
+            .{ cw, ch },
+            .{ 0, ch },
+        },
+        .shape = .block,
+    };
+    try renderer.render(&state, pixels, width, height);
+
+    // The first cell is painted with the no-OSC12 cursor fill (foreground).
+    const cw_us = @as(usize, @intCast(font.cell_width));
+    const cell_bottom = @as(usize, @intCast(font.cell_height / 2)) * @as(usize, width);
+    const center = cell_bottom + cw_us / 2;
+    try std.testing.expectEqual(argb(state.colors.foreground), pixels[center]);
+    // The second cell is untouched background.
+    const other = cell_bottom + cw_us + cw_us / 2;
+    try std.testing.expectEqual(argb(state.colors.background), pixels[other]);
 }
 
 test "cursor fill and glyph helpers follow TerminalColor" {

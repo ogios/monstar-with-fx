@@ -138,6 +138,15 @@ background: ?vt.color.RGB = null,
 foreground: ?vt.color.RGB = null,
 cursor_color: ?TerminalColor = null,
 cursor_text: ?TerminalColor = null,
+/// Smooth Neovide-style cursor glide between cells. Disabled by
+/// reduced-motion or an explicit `cursor-animation = false`.
+cursor_animation: bool = true,
+/// Duration of a long cursor jump in milliseconds; 0 snaps instantly.
+cursor_animation_length: u32 = 150,
+/// Duration of a short (one or two cell) jump in milliseconds.
+cursor_animation_short: u32 = 40,
+/// How far the back of the cursor trails the front, 0 to 100 percent.
+cursor_animation_trail: u32 = 100,
 selection_background: ?vt.color.RGB = null,
 selection_foreground: ?vt.color.RGB = null,
 copy_highlight: ?vt.color.RGB = null,
@@ -295,6 +304,14 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.cursor_color = try config_theme.parseTerminalColor(value);
     } else if (std.mem.eql(u8, key, "cursor-text")) {
         self.cursor_text = try config_theme.parseTerminalColor(value);
+    } else if (std.mem.eql(u8, key, "cursor-animation")) {
+        self.cursor_animation = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "cursor-animation-length")) {
+        self.cursor_animation_length = try parseMs(value);
+    } else if (std.mem.eql(u8, key, "cursor-animation-short")) {
+        self.cursor_animation_short = try parseMs(value);
+    } else if (std.mem.eql(u8, key, "cursor-animation-trail")) {
+        self.cursor_animation_trail = try parsePct(value);
     } else if (std.mem.eql(u8, key, "selection-background")) {
         self.selection_background = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "selection-foreground")) {
@@ -397,6 +414,24 @@ fn parseScrollMultiplier(value: []const u8) error{InvalidValue}!f64 {
     const multiplier = std.fmt.parseFloat(f64, std.mem.trim(u8, value, " \t")) catch return error.InvalidValue;
     if (!std.math.isFinite(multiplier)) return error.InvalidValue;
     return std.math.clamp(multiplier, 0.01, 10_000);
+}
+
+fn parseBool(value: []const u8) error{InvalidValue}!bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return error.InvalidValue;
+}
+
+fn parseMs(value: []const u8) error{InvalidValue}!u32 {
+    const ms = std.fmt.parseInt(u32, std.mem.trim(u8, value, " \t"), 10) catch return error.InvalidValue;
+    if (ms > 10_000) return error.InvalidValue;
+    return ms;
+}
+
+fn parsePct(value: []const u8) error{InvalidValue}!u32 {
+    const pct = std.fmt.parseInt(u32, std.mem.trim(u8, value, " \t"), 10) catch return error.InvalidValue;
+    if (pct > 100) return error.InvalidValue;
+    return pct;
 }
 
 fn parseOpacity(value: []const u8) error{InvalidValue}!u8 {

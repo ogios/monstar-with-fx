@@ -15,6 +15,8 @@ search_range: ?Renderer.LinkRange = null,
 search_matches: std.ArrayList(bool) = .empty,
 scrollbar: ?Renderer.ScrollbarThumb = null,
 hyperlink_hints: bool = false,
+/// Animated cursor quad, or null when no animation overlay is active.
+cursor_overlay: ?Renderer.CursorOverlay = null,
 kitty: []Renderer.KittyRenderItem = &.{},
 
 pub fn deinit(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {
@@ -60,6 +62,10 @@ pub fn replaceOverlays(
     self.search_matches = matches;
     self.scrollbar = scrollbar;
     self.hyperlink_hints = hyperlink_hints;
+}
+
+pub fn setCursorOverlay(self: *AsyncJobSnapshot, overlay: ?Renderer.CursorOverlay) void {
+    self.cursor_overlay = overlay;
 }
 
 pub fn releaseKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {
