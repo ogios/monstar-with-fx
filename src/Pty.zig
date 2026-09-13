@@ -116,11 +116,9 @@ pub fn spawn(
         posix.sigprocmask(linux.SIG.SETMASK, &empty_mask, null);
         if (linux.errno(linux.setsid()) != .SUCCESS) linux.exit(126);
         if (linux.errno(linux.ioctl(self.slave, linux.T.IOCSCTTY, 0)) != .SUCCESS) linux.exit(126);
-        if (linux.errno(linux.dup2(self.slave, 0)) != .SUCCESS) linux.exit(126);
-        if (linux.errno(linux.dup2(self.slave, 1)) != .SUCCESS) linux.exit(126);
-        if (linux.errno(linux.dup2(self.slave, 2)) != .SUCCESS) linux.exit(126);
+        // Inherited stdio may be closed, so the master and gate can occupy
+        // fd 0, 1, or 2. Finish using them before installing child stdio.
         _ = linux.close(self.master);
-        if (self.slave > 2) _ = linux.close(self.slave);
         if (options.cwd) |cwd| {
             if (linux.errno(linux.chdir(cwd)) != .SUCCESS) linux.exit(126);
         }
@@ -135,6 +133,15 @@ pub fn spawn(
                 if (linux.errno(rc) != .INTR) break;
             }
             _ = linux.close(gate_fds[0]);
+        }
+        if (linux.errno(linux.dup2(self.slave, 0)) != .SUCCESS) linux.exit(126);
+        if (linux.errno(linux.dup2(self.slave, 1)) != .SUCCESS) linux.exit(126);
+        if (linux.errno(linux.dup2(self.slave, 2)) != .SUCCESS) linux.exit(126);
+        if (self.slave > 2) {
+            _ = linux.close(self.slave);
+        } else {
+            // dup2(fd, fd) leaves CLOEXEC set on the original slave.
+            if (linux.errno(linux.fcntl(self.slave, linux.F.SETFD, 0)) != .SUCCESS) linux.exit(126);
         }
         _ = linux.execve(path, argv, envp);
         linux.exit(127); // exec failed
@@ -201,4 +208,33 @@ test "pty open and resize" {
     defer pty.deinit();
     try std.testing.expect(pty.master >= 0);
     try std.testing.expect(pty.slave >= 0);
+}
+
+test "spawn installs stdio with closed inherited descriptors" {
+    for ([_]bool{ false, true }) |gate_child| {
+        for (0..8) |closed_mask| {
+            // Isolate descriptor closure from the test runner and exercise
+            // exec: a surviving CLOEXEC flag is invisible before execve.
+            const fork_rc = linux.fork();
+            try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+            const pid: posix.pid_t = @intCast(fork_rc);
+            if (pid == 0) {
+                for (0..3) |fd| {
+                    if (closed_mask & (@as(usize, 1) << @intCast(fd)) != 0)
+                        _ = linux.close(@intCast(fd));
+                }
+                var pty = Pty.open(.{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 }) catch linux.exit(120);
+                const argv = [_:null]?[*:0]const u8{
+                    "/bin/sh", "-c", "test -t 0 && test -t 1 && test -t 2",
+                };
+                const envp = [_:null]?[*:0]const u8{};
+                const child = pty.spawn("/bin/sh", &argv, &envp, .{ .gate_child = gate_child }) catch linux.exit(121);
+                pty.releaseChild();
+                const status = Pty.wait(child) catch linux.exit(122);
+                pty.deinit();
+                linux.exit(if (status == 0) 0 else 123);
+            }
+            try std.testing.expectEqual(@as(u32, 0), try Pty.wait(pid));
+        }
+    }
 }
