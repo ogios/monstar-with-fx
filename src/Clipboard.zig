@@ -381,17 +381,19 @@ pub fn setDndCallback(self: *Clipboard, ctx: *anyopaque, callback: DndFn) void {
 /// Apply the running program's OSC 72 acceptance to the active Wayland drag.
 pub fn setDndAcceptance(self: *Clipboard, operation: enum { none, copy, move }) void {
     const offer = self.dnd_offer orelse return;
-    const mime = if (operation == .none) null else offer.bestDndMime();
-    offer.offer.accept(offer.enter_serial, mime);
     const allowed: wl.DataDeviceManager.DndAction = .{
         .copy = offer.source_actions.copy,
         .move = offer.source_actions.move,
     };
+    // OSC 72 can request an unavailable action, including a stale response
+    // after source actions change. Wayland requires preferred to be in allowed.
     const preferred: wl.DataDeviceManager.DndAction = switch (operation) {
         .none => .{},
-        .copy => .{ .copy = true },
-        .move => .{ .move = true },
+        .copy => .{ .copy = allowed.copy },
+        .move => .{ .move = allowed.move },
     };
+    const mime = if (preferred.copy or preferred.move) offer.bestDndMime() else null;
+    offer.offer.accept(offer.enter_serial, mime);
     offer.offer.setActions(allowed, preferred);
 }
 
@@ -1092,4 +1094,66 @@ test "drag negotiation prefers a supported source action" {
     try std.testing.expect(copy_and_move.allowed.move);
     try std.testing.expect(copy_and_move.preferred.copy);
     try std.testing.expect(!copy_and_move.preferred.move);
+}
+
+test "drag acceptance never sends an unsupported Wayland preferred action" {
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &fds,
+    )));
+    defer _ = linux.close(fds[1]);
+    const display = try wl.Display.connectToFd(fds[0]);
+    defer display.disconnect();
+    const registry = try display.getRegistry();
+    defer registry.destroy();
+    // Create a real client proxy, but inspect requests ourselves instead of
+    // running a compositor. No server replies are needed to marshal requests.
+    const proxy = try registry.bind(1, wl.DataOffer, 3);
+    defer proxy.destroy();
+    try std.testing.expectEqual(.SUCCESS, display.flush());
+    var buf: [512]u8 align(4) = undefined;
+    _ = try posix.read(fds[1], &buf); // Discard registry construction requests.
+
+    var clipboard: Clipboard = .init(std.testing.allocator, null, null);
+    defer clipboard.deinit();
+    var offer: DataOffer = .{ .clipboard = &clipboard, .offer = proxy, .enter_serial = 17 };
+    offer.noteMime("text/plain");
+    clipboard.dnd_offer = &offer;
+    defer clipboard.dnd_offer = null;
+
+    // Source mask, application choice, expected preference. Include a stale
+    // move choice after a source switches to copy-only, and the reverse.
+    inline for (.{
+        .{ @as(u32, 1), .move, @as(u32, 0) },
+        .{ @as(u32, 2), .copy, @as(u32, 0) },
+        .{ @as(u32, 3), .move, @as(u32, 2) },
+        .{ @as(u32, 1), .copy, @as(u32, 1) },
+        .{ @as(u32, 3), .none, @as(u32, 0) },
+        .{ @as(u32, 0), .copy, @as(u32, 0) },
+    }) |case| {
+        offer.source_actions = @bitCast(case[0]);
+        clipboard.setDndAcceptance(case[1]);
+        try std.testing.expectEqual(.SUCCESS, display.flush());
+        const n = try posix.read(fds[1], &buf);
+        const words = std.mem.bytesAsSlice(u32, buf[0..n]);
+        const accept_size = words[1] >> 16;
+        try std.testing.expectEqual(proxy.getId(), words[0]);
+        try std.testing.expectEqual(@as(u32, 0), words[1] & 0xffff); // accept
+        try std.testing.expectEqual(@as(u32, 17), words[2]);
+        if (case[2] == 0) {
+            try std.testing.expectEqual(@as(u32, 0), words[3]); // Null MIME rejects the drop.
+        } else {
+            try std.testing.expectEqualStrings("text/plain\x00", buf[16..][0..words[3]]);
+        }
+        const actions = words[accept_size / 4 ..];
+        try std.testing.expectEqual(@as(usize, 4), actions.len);
+        try std.testing.expectEqual(proxy.getId(), actions[0]);
+        try std.testing.expectEqual(@as(u32, (16 << 16) | 4), actions[1]); // set_actions
+        try std.testing.expectEqual(case[0], actions[2]);
+        try std.testing.expectEqual(case[2], actions[3]);
+    }
 }
