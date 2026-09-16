@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Build and install Monstar on this machine using makepkg.
 #
-# This wraps the Arch packaging template (packaging/arch/monstar-git.PKGBUILD.in),
+# This wraps the Arch packaging template (packaging/arch/monstar-with-fx-git.PKGBUILD.in),
 # generating a PKGBUILD in a temp dir and letting makepkg fetch deps, build,
 # package, and install. Unlike the template's default, the source is pointed at
 # this repository's working tree so the installed binary matches HEAD.
 #
 # Usage:
-#   ./packaging/install.sh              build + install (makepkg -si; sudo on install)
+#   ./packaging/install.sh              build + install (makepkg -si --noconfirm; sudo on install)
 #   ./packaging/install.sh --no-install build + package only (makepkg -s)
 #
 # Options:
@@ -21,7 +21,10 @@ cd "$REPO_ROOT"
 
 INSTALL=1
 
-die() { echo "error: $*" >&2; exit 1; }
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
 
 usage() {
   sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -29,31 +32,32 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --no-install)
-      INSTALL=0
-      shift
-      ;;
-    -h|--help)
-      usage; exit 0
-      ;;
-    *)
-      die "unknown option: $1 (see --help)"
-      ;;
+  --no-install)
+    INSTALL=0
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    die "unknown option: $1 (see --help)"
+    ;;
   esac
 done
 
 # -- Preflight -------------------------------------------------------------
-command -v makepkg >/dev/null 2>&1 \
-  || die "makepkg not found (install base-devel) -- this script targets Arch Linux"
-command -v pacman >/dev/null 2>&1 \
-  || die "pacman not found -- this script targets Arch Linux"
+command -v makepkg >/dev/null 2>&1 ||
+  die "makepkg not found (install base-devel) -- this script targets Arch Linux"
+command -v pacman >/dev/null 2>&1 ||
+  die "pacman not found -- this script targets Arch Linux"
 
 # -- Generate PKGBUILD in an isolated dir ----------------------------------
 PKGDIR="$(mktemp -d)"
 trap 'rm -rf "$PKGDIR"' EXIT
 
-echo "==> Generating PKGBUILD from packaging/arch/monstar-git.PKGBUILD.in"
-sed 's/@VERSION@/0/' packaging/arch/monstar-git.PKGBUILD.in > "$PKGDIR/PKGBUILD"
+echo "==> Generating PKGBUILD from packaging/arch/monstar-with-fx-git.PKGBUILD.in"
+sed 's/@VERSION@/0/' packaging/arch/monstar-with-fx-git.PKGBUILD.in >"$PKGDIR/PKGBUILD"
 
 # Point the source at this repository's working tree so makepkg builds the
 # checked-out HEAD (a local file:// git source, unlike the default GitHub
@@ -64,7 +68,7 @@ sed -i \
   "$PKGDIR/PKGBUILD"
 
 # arch pkgdesc is injected after pkgdesc; also disable the debug split so the
-# install is the bare ReleaseFast binary, not a monstar-git-debug package.
+# install is the bare ReleaseFast binary, not a monstar-with-fx-git-debug package.
 sed -i "s|^pkgdesc=.*|&\noptions=('!debug')|" "$PKGDIR/PKGBUILD"
 
 grep '^pkgver\|^source\|^sha256\|^options' "$PKGDIR/PKGBUILD" >&2
@@ -72,7 +76,7 @@ grep '^pkgver\|^source\|^sha256\|^options' "$PKGDIR/PKGBUILD" >&2
 # -- Build (and optionally install) ----------------------------------------
 echo "==> Running makepkg in ${PKGDIR}"
 if [[ "$INSTALL" -eq 1 ]]; then
-  (cd "$PKGDIR" && makepkg -si) || die "makepkg -si failed"
+  (cd "$PKGDIR" && makepkg -si --noconfirm) || die "makepkg -si failed"
 else
   (cd "$PKGDIR" && makepkg -s) || die "makepkg -s failed"
 fi
