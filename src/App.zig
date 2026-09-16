@@ -33,6 +33,7 @@ const FrameDamageTracker = @import("FrameDamageTracker.zig");
 const KittyImageCache = @import("KittyImageCache.zig");
 const ScrollbackSearch = @import("ScrollbackSearch.zig");
 const ScrollDetector = @import("ScrollDetector.zig");
+const Tab = @import("Tab.zig");
 const TerminalLayout = @import("TerminalLayout.zig");
 const cgroup = @import("cgroup.zig");
 const DbusConnection = @import("dbus/Connection.zig");
@@ -88,8 +89,8 @@ config: Config,
 config_path: ?[:0]const u8,
 config_overrides: []const []const u8,
 environ: std.process.Environ,
-term: vt.Terminal,
-stream: AppStream,
+tabs: std.ArrayList(*Tab),
+active: *Tab,
 /// The single terminal snapshot both render paths draw from. Updated
 /// only on the main thread while no render target is checked out, so
 /// the async worker can read it without locks while a job is in flight.
@@ -109,18 +110,10 @@ async_force_full: bool,
 held_frame: ?*Window.Buffer,
 /// Owned overlay and Kitty inputs for the in-flight async job.
 async_job: AsyncJobSnapshot,
-/// Pinned copies of kitty image data shared between consecutive async
-/// jobs, so the worker never reads terminal-owned image bytes.
-kitty_cache: KittyImageCache,
 /// The window geometry changed, so a repaint at the new size must
 /// happen even while synchronized output has content frames frozen.
 geometry_redraw: bool,
 frame_damage: FrameDamageTracker,
-pty: Pty,
-/// Gather-thread pipeline draining the pty master; the main loop
-/// consumes parsed batches via its ready_fd in the poll set.
-pipeline: ReadPipeline,
-child_pid: posix.pid_t,
 font: Font,
 /// The physical pixel size the font is currently loaded at.
 font_size_px: f64,
@@ -129,6 +122,9 @@ font_size_px: f64,
 runtime_font_size: ?Config.FontSize,
 /// Current physical grid rectangle and effective padding.
 layout: TerminalLayout,
+/// Vertical extent of the tab-bar strip at the top of the surface, in
+/// pixels. The terminal grid is laid out below it.
+tab_bar_height: u31,
 /// Selection highlight colors, from config or OSC 17/19. Snapshotted
 /// into the raster worker's renderer on (re)configure.
 selection_bg: vt.color.RGB,
@@ -163,23 +159,18 @@ ime_focused: bool,
 ime_preedit: ?[]u8,
 ime_pending_preedit: ?[]u8,
 ime_pending_commit: ?[]u8,
-/// Native incremental scrollback search, active even with an empty query.
-search: ?ScrollbackSearch,
-/// Cached DEC mode 2048 state, to detect the application enabling
-/// in-band size reports.
-in_band_reports: bool,
-/// Cached DEC mode 2026 state, to detect synchronized output boundaries.
-sync_output: bool,
-/// PTY input that couldn't be written yet (master is nonblocking to
-/// avoid deadlocking against a child that has stopped reading while
-/// flooding output). Flushed when the master polls writable.
-write_queue: std.ArrayList(u8),
-/// Consumed prefix, reclaimed on drain or amortized compaction at enqueue.
-write_queue_offset: usize = 0,
-/// The child has exited and been reaped (via SIGCHLD).
-child_exited: bool,
-/// Keep the window open after the child exits.
+/// Keep the window open after the last child exits.
 hold: bool,
+/// Session command reused to spawn each new tab.
+child_path: [*:0]const u8,
+child_argv: [*:null]const ?[*:0]const u8,
+child_envp: [*:null]const ?[*:0]const u8,
+working_directory: ?[:0]const u8,
+/// Closed tabs awaiting child reaping or whose kitty image cache is still
+/// borrowed by an in-flight async snapshot. A manually closed tab must retain
+/// its child PID until wait4 reaps it; otherwise the exited child remains a
+/// zombie until Monstar itself exits.
+pending_tab_cleanup: std.ArrayList(*Tab) = .empty,
 /// Session bus connection, used for notifications and future desktop settings.
 /// `void` when built with `-Ddbus=false`.
 dbus: DbusHandle,
@@ -255,20 +246,21 @@ scroll_had_value120: bool,
 scroll_stopped: bool,
 /// True while the left button is down for terminal-side selection.
 selecting: bool,
+/// A left-button press consumed by the tab strip. Its matching release must
+/// not leak into terminal selection or application mouse reporting.
+tab_bar_press: bool,
+/// A middle-button press consumed by the tab strip. Kept separately from the
+/// left-button gesture so its release cannot paste after closing a tab.
+tab_bar_middle_press: bool,
 /// True when the active drag should produce a rectangular selection.
 selection_rectangle: bool,
 selection_gesture: vt.SelectionGesture,
 /// Button press currently owned by application mouse reporting.
 mouse_button: ?vt.input.MouseButton,
-/// True after OSC 22 explicitly set the pointer shape; otherwise mouse
-/// reporting uses an arrow and normal terminal selection uses I-beam.
-mouse_shape_explicit: bool,
-/// Active screen at the last check, to detect alt screen switches.
-active_screen: vt.ScreenSet.Key,
 /// Serial of the most recent input event, required to claim selections.
 last_serial: u32,
 clipboard: Clipboard,
-kitty_clipboard: KittyClipboard,
+next_tab_id: u64,
 const selection_word_boundaries = [_]u21{
     0,   ' ', '\t', '\'', '"',
     '│',
@@ -388,10 +380,13 @@ fn dimensionForCells(cells: u16, cell_size: u31, before: u31, after: u31) u31 {
     ));
 }
 
-const TerminalHandler = vt.TerminalStream.Handler;
-const AppStream = vt.Stream(AppStreamHandler);
+pub const TerminalHandler = vt.TerminalStream.Handler;
+pub const AppStream = vt.Stream(AppStreamHandler);
 
-const AppStreamHandler = struct {
+pub const AppStreamHandler = struct {
+    /// The tab that owns this stream, so background tabs parse into their
+    /// own terminal while view-global effects still reach the App.
+    tab: *Tab,
     app: *App,
     terminal_handler: TerminalHandler,
 
@@ -411,68 +406,68 @@ const AppStreamHandler = struct {
             .clipboard_contents, .kitty_clipboard => {},
             else => self.terminal_handler.vt(action, value),
         }
+        const app = self.app;
         switch (action) {
-            .color_operation => self.app.handleOscColorOperation(&value.requests, value.terminator),
-            .kitty_color_report => self.app.answerKittySelectionColorQueries(value),
-            .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
+            .color_operation => app.handleOscColorOperation(self.tab, &value.requests, value.terminator),
+            .kitty_color_report => app.answerKittySelectionColorQueries(self.tab, value),
+            .clipboard_contents => app.setOsc52Clipboard(self.tab, value.kind, value.data),
             .kitty_clipboard => {
-                self.app.kitty_clipboard.handle(value) catch |err| {
+                self.tab.kitty_clipboard.handle(value) catch |err| {
                     if (err == error.QueueFull) {
-                        const response = self.app.kitty_clipboard.rejection();
-                        self.app.writeKittyClipboardStatus(response.op, response.id, response.terminator, .EBUSY);
+                        const response = self.tab.kitty_clipboard.rejection();
+                        app.writeKittyClipboardStatus(self.tab, response.op, response.id, response.terminator, .EBUSY);
                     } else {
                         log.warn("failed to handle OSC 5522 command: {}", .{err});
                     }
                 };
-                self.app.pumpKittyClipboard();
+                app.pumpKittyClipboard(self.tab);
             },
-            .show_desktop_notification => self.app.showDesktopNotification(value.title, value.body),
+            .show_desktop_notification => app.showDesktopNotification(value.title, value.body),
             .mouse_shape => {
-                self.app.mouse_shape_explicit = true;
-                self.app.syncCursorShape();
+                self.tab.mouse_shape_explicit = true;
+                app.syncCursorShape();
             },
             .set_mode => {
-                if (value.mode == .report_color_scheme) self.app.sendColorSchemeReport();
+                if (value.mode == .report_color_scheme) app.sendColorSchemeReport(self.tab);
                 if (value.mode == .in_band_size_reports) {
-                    self.app.in_band_reports = true;
-                    self.app.sendSizeReport();
+                    self.tab.in_band_reports = true;
+                    app.sendSizeReport(self.tab);
                 }
-                self.app.syncCursorShape();
+                app.syncCursorShape();
             },
             .restore_mode => {
-                if (value.mode == .report_color_scheme and self.app.term.modes.get(.report_color_scheme)) {
-                    self.app.sendColorSchemeReport();
+                if (value.mode == .report_color_scheme and self.tab.term.modes.get(.report_color_scheme)) {
+                    app.sendColorSchemeReport(self.tab);
                 }
                 if (value.mode == .in_band_size_reports) {
-                    const enabled = self.app.term.modes.get(.in_band_size_reports);
-                    self.app.in_band_reports = enabled;
-                    if (enabled) self.app.sendSizeReport();
+                    const enabled = self.tab.term.modes.get(.in_band_size_reports);
+                    self.tab.in_band_reports = enabled;
+                    if (enabled) app.sendSizeReport(self.tab);
                 }
-                self.app.syncCursorShape();
+                app.syncCursorShape();
             },
             .reset_mode => {
-                if (value.mode == .in_band_size_reports) self.app.in_band_reports = false;
-                self.app.syncCursorShape();
+                if (value.mode == .in_band_size_reports) self.tab.in_band_reports = false;
+                app.syncCursorShape();
             },
             .full_reset => {
-                self.app.kitty_clipboard.reset();
-                self.app.mouse_shape_explicit = false;
-                self.app.in_band_reports = false;
-                self.app.syncCursorShape();
+                self.tab.kitty_clipboard.reset();
+                self.tab.mouse_shape_explicit = false;
+                self.tab.in_band_reports = false;
+                app.syncCursorShape();
             },
             else => {},
         }
     }
 };
 
-/// The directory for kitty t=t temporary-file transmissions, resolved
-/// like Ghostty: $TMPDIR, then $TMP, then /tmp. Returned slices point
-/// into the process environment and stay valid for its lifetime.
-fn tmpDirPath(environ: std.process.Environ) []const u8 {
-    const dir = environ.getPosix("TMPDIR") orelse
-        environ.getPosix("TMP") orelse
-        return "/tmp";
-    return std.mem.trimEnd(u8, dir, &.{std.fs.path.sep});
+/// The currently active tab.
+pub fn tab(self: *const App) *Tab {
+    return self.active;
+}
+
+pub fn tabAt(self: *const App, index: usize) *Tab {
+    return self.tabs.items[index];
 }
 
 /// `argv`/`envp` must stay valid for the lifetime of the call (the child
@@ -500,7 +495,8 @@ pub fn init(
     vt.sys.decode_png = decodePng;
 
     const startup_size = initialTerminalSize(options.initial_size, &font, config);
-    const startup_padding = physicalPadding(config, 120);
+    const tab_bar_height = font.cell_height;
+    const startup_padding = paddingWithTabBar(config, 120, tab_bar_height);
     const startup_layout = TerminalLayout.init(
         dimensionForCells(startup_size.cols, font.cell_width, startup_padding.left, startup_padding.right),
         dimensionForCells(startup_size.rows, font.cell_height, startup_padding.top, startup_padding.bottom),
@@ -508,34 +504,6 @@ pub fn init(
         font.cell_height,
         startup_padding,
     );
-
-    var term: vt.Terminal = try .init(io, alloc, .{
-        .cols = startup_size.cols,
-        .rows = startup_size.rows,
-        .max_scrollback_bytes = config.scrollback_limit,
-        .colors = config.terminalColors(.dark),
-        .default_modes = .{ .grapheme_cluster = true },
-        // libghostty-vt defaults to a conservative 10MB, which rejects a
-        // single fullscreen image on large displays (a 4K RGBA frame is
-        // ~32MB). Default matches the Ghostty app (320MB).
-        .kitty_image_storage_limit = config.image_storage_limit,
-        // Accept every kitty transmission medium, matching the Ghostty
-        // app. t=s shared memory matters most for throughput: senders
-        // like `mpv --vo=kitty --vo-kitty-use-shm=yes` move pixels
-        // through POSIX shm instead of base64 escape data, which is
-        // orders of magnitude cheaper to parse. t=t temporary files are
-        // only read (and then deleted) from inside the temp dir.
-        .kitty_image_loading_limits = .allWithTempDir(tmpDirPath(environ)),
-    });
-    errdefer term.deinit(alloc);
-    try term.resize(alloc, .{
-        .cols = startup_size.cols,
-        .rows = startup_size.rows,
-        .cell_size_px = .{
-            .width = font.cell_width,
-            .height = font.cell_height,
-        },
-    });
 
     // Child-exit detection is driven by SIGCHLD, not pty EOF; config
     // reloads are driven by SIGUSR1. Block both and receive them through
@@ -567,46 +535,18 @@ pub fn init(
         if (dbus_connection) |*connection| connection.deinit();
     };
 
-    var pty: Pty = try .open(.{
-        .row = startup_size.rows,
-        .col = startup_size.cols,
-        .xpixel = @intCast(startup_size.cols * font.cell_width),
-        .ypixel = @intCast(startup_size.rows * font.cell_height),
-    });
-    errdefer pty.deinit();
-
-    // When enabled, move the child into its own transient systemd scope
-    // before it can exec. The gate holds the child so grandchildren cannot
-    // escape the scope; on failure, releasing the gate lets it proceed
-    // un-isolated. Only the request is sent here: systemd's reply and the
-    // pid migration land while we set up the window, and the gate is
-    // released once both are confirmed below. Always false with
-    // -Ddbus=false, since scope creation is a systemd1 D-Bus call.
+    // When enabled, move each session child into its own transient
+    // systemd scope before it can exec. The gate holds the child so
+    // grandchildren cannot escape the scope; on failure, releasing the
+    // gate lets it proceed un-isolated. Only the request is sent here:
+    // systemd's reply and the pid migration land while we set up the
+    // window, and the gate is released once both are confirmed below.
+    // Always false with -Ddbus=false, since scope creation is a
+    // systemd1 D-Bus call.
     const use_cgroup_scope = if (build_options.enable_dbus)
         config.linux_cgroup == .always and dbus_connection != null and cgroup.systemdBooted()
     else
         false;
-    const child_pid = try pty.spawn(path, argv, envp, .{
-        .cwd = if (options.working_directory) |cwd| cwd.ptr else null,
-        .gate_child = use_cgroup_scope,
-    });
-    var pending_scope: ?cgroup.Pending = null;
-    if (build_options.enable_dbus) {
-        if (use_cgroup_scope) {
-            pending_scope = cgroup.startMoveIntoScope(&dbus_connection.?, @intCast(child_pid)) catch blk: {
-                log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
-                break :blk null;
-            };
-        }
-    }
-    // On error paths the errdefer'd pty.deinit releases the gate.
-    errdefer if (pending_scope) |pending| pending.cancel();
-    if (pending_scope == null) pty.releaseChild();
-
-    // Nonblocking master: a blocking write can deadlock the whole loop
-    // when the child floods output (echoed responses need output-queue
-    // space) while we respond to queries embedded in that output.
-    setNonblocking(pty.master);
 
     const window = try Window.create(alloc, config.app_id, options.title, startup_size.window);
     errdefer window.destroy();
@@ -647,20 +587,37 @@ pub fn init(
     const compression_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(compression_fd);
 
-    // Scope confirmation ran concurrently with the window setup above,
-    // so this rarely waits; the child stays gated until its migration
-    // is confirmed (or abandoned).
-    if (pending_scope) |pending| {
-        pending_scope = null;
-        pending.finish() catch {
-            log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
-        };
-        pty.releaseChild();
-    }
-
-    // Self-reference into listeners/streams requires a stable address.
+    // Allocate the App to a stable address before the first tab, so that
+    // tab can hold a back-reference to the owning App.
     const self = try alloc.create(App);
     errdefer alloc.destroy(self);
+
+    const first_tab = try Tab.init(alloc, io, self, 1, config, environ, path, argv, envp, .{
+        .cols = startup_size.cols,
+        .rows = startup_size.rows,
+        .cell_width = font.cell_width,
+        .cell_height = font.cell_height,
+        .working_directory = options.working_directory,
+        .gate_child = use_cgroup_scope,
+    });
+    errdefer first_tab.deinit();
+
+    var pending_scope: ?cgroup.Pending = null;
+    if (build_options.enable_dbus) {
+        if (use_cgroup_scope) {
+            pending_scope = cgroup.startMoveIntoScope(&dbus_connection.?, @intCast(first_tab.child_pid)) catch blk: {
+                log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
+                break :blk null;
+            };
+        }
+    }
+    // On error paths the errdefer'd first_tab.deinit releases the gate.
+    errdefer if (pending_scope) |pending| pending.cancel();
+    if (pending_scope == null) first_tab.releaseChild();
+
+    var tabs: std.ArrayList(*Tab) = .empty;
+    try tabs.append(alloc, first_tab);
+
     self.* = .{
         .alloc = alloc,
         .io = io,
@@ -669,8 +626,8 @@ pub fn init(
         .config_path = options.config_path,
         .config_overrides = options.config_overrides,
         .environ = environ,
-        .term = term,
-        .stream = undefined, // needs the final Terminal address; set below
+        .tabs = tabs,
+        .active = first_tab,
         .render_state = .empty,
         .scroll_detector = .{},
         .async_raster = null,
@@ -679,16 +636,13 @@ pub fn init(
         .async_force_full = true,
         .held_frame = null,
         .async_job = .{},
-        .kitty_cache = .empty,
         .geometry_redraw = false,
         .frame_damage = .init(alloc),
-        .pty = pty,
-        .pipeline = try .init(pty.master),
-        .child_pid = child_pid,
         .font = font,
         .font_size_px = font_size_px,
         .runtime_font_size = null,
         .layout = startup_layout,
+        .tab_bar_height = tab_bar_height,
         .selection_bg = config.effectiveSelectionBackground(.dark),
         .selection_fg = config.effectiveSelectionForeground(.dark),
         .selection_bg_override = null,
@@ -710,12 +664,11 @@ pub fn init(
         .ime_preedit = null,
         .ime_pending_preedit = null,
         .ime_pending_commit = null,
-        .search = null,
-        .in_band_reports = false,
-        .sync_output = false,
-        .write_queue = .empty,
-        .child_exited = false,
         .hold = options.hold,
+        .child_path = path,
+        .child_argv = argv,
+        .child_envp = envp,
+        .working_directory = options.working_directory,
         .dbus = dbus_connection,
         .dbus_fd = -1,
         .pending_open_uri = null,
@@ -740,7 +693,7 @@ pub fn init(
         .scrollbar_fd = scrollbar_fd,
         .kitty_animation_fd = kitty_animation_fd,
         .compression_fd = compression_fd,
-        .compression_activity = term.compressionActivity(),
+        .compression_activity = first_tab.term.compressionActivity(),
         .scrollbar_alpha = 0,
         .scrollbar_fading = false,
         .scrollbar_fade_elapsed_ms = 0,
@@ -767,38 +720,29 @@ pub fn init(
         .scroll_had_value120 = false,
         .scroll_stopped = false,
         .selecting = false,
+        .tab_bar_press = false,
+        .tab_bar_middle_press = false,
         .selection_rectangle = false,
         .selection_gesture = .init,
         .mouse_button = null,
-        .mouse_shape_explicit = false,
-        .active_screen = .primary,
         .last_serial = 0,
         .clipboard = .init(alloc, window.data_manager, window.primary_manager),
-        .kitty_clipboard = .init(alloc),
+        .next_tab_id = 2,
     };
-    self.stream = .init(.{
-        .allocator = alloc,
-        .handler = .{
-            .app = self,
-            .terminal_handler = .init(&self.term),
-        },
-    });
-    self.stream.handler.terminal_handler.terminfo_name = "monstar";
+
+    // Scope confirmation ran concurrently with the window setup above,
+    // so this rarely waits; the child stays gated until its migration
+    // is confirmed (or abandoned).
+    if (pending_scope) |pending| {
+        pending_scope = null;
+        pending.finish() catch {
+            log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
+        };
+        first_tab.releaseChild();
+    }
 
     // Handle sequences that need responses or side effects.
-    var effects: Effects = .readonly;
-    effects.write_pty = effectWritePty;
-    effects.device_attributes = effectDeviceAttributes;
-    effects.enquiry = effectEnquiry;
-    effects.size = effectSize;
-    effects.color_scheme = effectColorScheme;
-    effects.xtversion = effectXtversion;
-    effects.title_changed = effectTitleChanged;
-    effects.bell = effectBell;
-    effects.progress_report = effectProgressReport;
-    effects.clipboard_read = effectClipboardRead;
-    effects.drag_and_drop = effectDragAndDrop;
-    self.stream.handler.terminal_handler.effects = effects;
+    self.installEffects(first_tab);
     self.clipboard.setDndCallback(self, dndEvent);
 
     self.initDbus();
@@ -869,10 +813,30 @@ const Handler = TerminalHandler;
 const Effects = Handler.Effects;
 
 /// Effects callbacks only receive the terminal handler; walk back up through
-/// monstar's wrapper handler.
-fn appFromHandler(handler: *Handler) *App {
+/// monstar's wrapper handler to the tab that owns the terminal.
+fn appFromHandler(handler: *Handler) *Tab {
     const app_handler: *AppStreamHandler = @fieldParentPtr("terminal_handler", handler);
-    return app_handler.app;
+    return app_handler.tab;
+}
+
+/// Install the sequence effects (PTY replies, size reports, bell, title,
+/// drag-and-drop) on a tab's handler. Every tab, not just the first, needs them
+/// so background tabs answer queries against their own pty.
+fn installEffects(self: *App, tb: *Tab) void {
+    _ = self;
+    var effects: Effects = .readonly;
+    effects.write_pty = effectWritePty;
+    effects.device_attributes = effectDeviceAttributes;
+    effects.enquiry = effectEnquiry;
+    effects.size = effectSize;
+    effects.color_scheme = effectColorScheme;
+    effects.xtversion = effectXtversion;
+    effects.title_changed = effectTitleChanged;
+    effects.bell = effectBell;
+    effects.progress_report = effectProgressReport;
+    effects.clipboard_read = effectClipboardRead;
+    effects.drag_and_drop = effectDragAndDrop;
+    tb.stream.handler.terminal_handler.effects = effects;
 }
 
 /// Return type of an Effects callback, e.g. device_attributes.
@@ -902,28 +866,28 @@ fn effectEnquiry(_: *Handler) []const u8 {
 }
 
 fn effectProgressReport(handler: *Handler, report: vt.osc.Command.ProgressReport) void {
-    appFromHandler(handler).reportTaskbarProgress(report);
+    appFromHandler(handler).app.reportTaskbarProgress(report);
 }
 
 fn effectSize(handler: *Handler) ?vt.size_report.Size {
-    return appFromHandler(handler).currentSize();
+    return appFromHandler(handler).app.currentSize(appFromHandler(handler));
 }
 
-fn currentSize(self: *App) vt.size_report.Size {
+fn currentSize(self: *App, tb: *Tab) vt.size_report.Size {
     return .{
-        .rows = self.term.rows,
-        .columns = self.term.cols,
+        .rows = tb.term.rows,
+        .columns = tb.term.cols,
         .cell_width = self.font.cell_width,
         .cell_height = self.font.cell_height,
     };
 }
 
 fn effectColorScheme(handler: *Handler) ?vt.device_status.ColorScheme {
-    return appFromHandler(handler).color_scheme;
+    return appFromHandler(handler).app.color_scheme;
 }
 
-fn sendColorSchemeReport(self: *App) void {
-    self.writePty(switch (self.color_scheme) {
+fn sendColorSchemeReport(self: *App, tb: *Tab) void {
+    tb.writePty(switch (self.color_scheme) {
         .dark => "\x1B[?997;1n",
         .light => "\x1B[?997;2n",
     });
@@ -934,13 +898,16 @@ fn effectXtversion(_: *Handler) []const u8 {
 }
 
 fn effectTitleChanged(handler: *Handler) void {
-    const self = appFromHandler(handler);
-    const title = self.term.getTitle() orelse return;
-    self.window.toplevel.setTitle(title.ptr);
+    const tb = appFromHandler(handler);
+    // The tab bar shows every tab, so any title change needs a repaint.
+    tb.app.needs_redraw = true;
+    // Only reflect the title of the visible (active) tab in the window.
+    if (tb != tb.app.tab()) return;
+    if (tb.term.getTitle()) |title| tb.app.window.toplevel.setTitle(title.ptr);
 }
 
 fn effectBell(handler: *Handler) void {
-    appFromHandler(handler).window.ringBell();
+    appFromHandler(handler).app.window.ringBell();
 }
 
 fn effectClipboardRead(_: *Handler, read: vt.clipboard.Read) void {
@@ -951,10 +918,10 @@ fn effectClipboardRead(_: *Handler, read: vt.clipboard.Read) void {
 
 fn effectDragAndDrop(handler: *Handler, event: vt.kitty.dnd.Event) void {
     if (event != .acceptance) return;
-    const self = appFromHandler(handler);
-    const state = self.term.kitty_dnd orelse return;
+    const tb = appFromHandler(handler);
+    const state = tb.term.kitty_dnd orelse return;
     const accepted = state.clientAccepted() orelse return;
-    self.clipboard.setDndAcceptance(switch (accepted) {
+    tb.app.clipboard.setDndAcceptance(switch (accepted) {
         .none => .none,
         .copy => .copy,
         .move => .move,
@@ -975,7 +942,7 @@ fn showDesktopNotification(self: *App, title: []const u8, body: []const u8) void
     const effective_title = if (title.len > 0)
         title
     else
-        self.term.getTitle() orelse app_name;
+        self.tab().term.getTitle() orelse app_name;
 
     self.sendDesktopNotification(effective_title, body) catch |err| {
         log.warn("failed to send desktop notification: {}", .{err});
@@ -1109,6 +1076,34 @@ fn expireDbusRequests(self: *App) void {
         const pending = self.pending_dbus.orderedRemove(i);
         pending.kind.deinit(self.alloc);
     }
+}
+
+/// A bare tab wired to a pipe as its pty master, for exercising write-queue
+/// and clipboard write paths without a live child. The caller owns the tab
+/// and must deinit its write_queue.
+fn pipeBackedTab(alloc: std.mem.Allocator, master: posix.fd_t) *Tab {
+    const tb = alloc.create(Tab) catch unreachable;
+    tb.* = .{
+        .alloc = alloc,
+        .io = std.testing.io,
+        .app = undefined,
+        .id = 1,
+        .term = undefined,
+        .stream = undefined,
+        .pty = .{ .master = master, .slave = -1, .gate = -1 },
+        .pipeline = undefined,
+        .child_pid = -1,
+        .child_exited = false,
+        .write_queue = .empty,
+        .write_queue_offset = 0,
+        .search = null,
+        .kitty_cache = .empty,
+        .kitty_clipboard = .init(alloc),
+        .in_band_reports = false,
+        .mouse_shape_explicit = false,
+        .active_screen = .primary,
+    };
+    return tb;
 }
 
 test "desktop calls return before replies and correlate delayed notifications" {
@@ -1508,7 +1503,9 @@ fn handlePortalSettingChanged(self: *App, message: *const DbusConnection.Message
 fn setColorScheme(self: *App, color_scheme: vt.device_status.ColorScheme, report: bool) void {
     self.color_scheme = color_scheme;
     self.applyColorDefaults();
-    if (report and self.term.modes.get(.report_color_scheme)) self.sendColorSchemeReport();
+    if (report) for (self.tabs.items) |tb| {
+        if (tb.term.modes.get(.report_color_scheme)) self.sendColorSchemeReport(tb);
+    };
 }
 
 fn setReducedMotion(self: *App, reduced_motion: bool) void {
@@ -1569,22 +1566,14 @@ fn setNonblocking(fd: posix.fd_t) void {
 
 pub fn deinit(self: *App) void {
     self.hangupChild();
-    self.pipeline.deinit();
-    self.pty.deinit();
-    self.cancelDrag();
-    self.selection_gesture.deinit(&self.term);
     if (self.async_raster_loader) |*loader| loader.deinit();
     if (self.async_raster) |*async_raster| async_raster.deinit();
     self.frame_damage.deinit();
-    self.async_job.deinit(self.alloc, &self.kitty_cache);
+    self.async_job.deinit(self.alloc);
     if (self.hovered_link) |link| self.alloc.free(link.uri);
     if (self.link_press) |press| self.alloc.free(press.uri);
-    self.kitty_cache.deinit(self.alloc);
     self.clearImeText();
-    if (self.search) |*search| search.deinit(self.alloc, &self.term);
-    self.kitty_clipboard.deinit();
     self.clipboard.deinit();
-    self.write_queue.deinit(self.alloc);
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
     self.deinitDbus();
     _ = std.os.linux.close(self.compression_fd);
@@ -1602,14 +1591,16 @@ pub fn deinit(self: *App) void {
     self.window.destroy();
     self.scroll_detector.deinit(self.alloc);
     self.render_state.deinit(self.alloc);
-    self.stream.deinit();
-    self.term.deinit(self.alloc);
+    for (self.pending_tab_cleanup.items) |closing| closing.deinit();
+    self.pending_tab_cleanup.deinit(self.alloc);
+    for (self.tabs.items) |tb| tb.deinit();
+    self.tabs.deinit(self.alloc);
     self.font.deinit(self.alloc);
     self.config_arena.deinit();
     self.alloc.destroy(self);
 }
 
-/// Run until the window is closed or, without hold mode, the child exits.
+/// Run until the window is closed or, without hold mode, every child exits.
 pub fn run(self: *App) !void {
     errdefer self.hangupChild();
 
@@ -1617,14 +1608,13 @@ pub fn run(self: *App) !void {
     // the first configure so it is usually ready by the first frame.
     self.startAsyncRasterLoad();
 
-    try self.pipeline.start();
+    for (self.tabs.items) |tb| try tb.start();
 
     const display = self.window.display;
-    var fds = [_]posix.pollfd{
+    const base = [_]posix.pollfd{
         .{ .fd = display.getFd(), .events = posix.POLL.IN, .revents = 0 },
-        // Parsed pty batches arrive via the pipeline's ready eventfd;
-        // the master itself is only polled for writability (below).
-        .{ .fd = self.pipeline.ready_fd, .events = posix.POLL.IN, .revents = 0 },
+        // Per-tab pipeline fds and pty-write fds are appended below.
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 },
         .{ .fd = self.repeat_fd, .events = posix.POLL.IN, .revents = 0 },
         // In-flight paste pipe; negative (ignored) while idle.
@@ -1641,27 +1631,61 @@ pub fn run(self: *App) !void {
         .{ .fd = self.scrollbar_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.kitty_animation_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.compression_fd, .events = posix.POLL.IN, .revents = 0 },
-    } ++ [_]posix.pollfd{.{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 }} ** Clipboard.max_outgoing_transfers;
-    const wl_fd = &fds[0];
-    const pipeline_fd = &fds[1];
-    const pty_write_fd = &fds[2];
-    const repeat_fd = &fds[3];
-    const paste_fd = &fds[4];
-    const signal_fd = &fds[5];
-    const sync_output_fd = &fds[6];
-    const selection_autoscroll_fd = &fds[7];
-    const copy_highlight_fd = &fds[8];
-    const taskbar_progress_fd = &fds[9];
-    const dbus_fd = &fds[10];
-    const async_fd = &fds[11];
-    const fling_fd = &fds[12];
-    const search_fd = &fds[13];
-    const scrollbar_fd = &fds[14];
-    const kitty_animation_fd = &fds[15];
-    const compression_fd = &fds[16];
-    const outgoing_clipboard_fds = fds[17..][0..Clipboard.max_outgoing_transfers];
+    };
+    const k_wl = 0;
+    const k_repeat = 3;
+    const k_paste = 4;
+    const k_signal = 5;
+    const k_sync_output = 6;
+    const k_selection_autoscroll = 7;
+    const k_copy_highlight = 8;
+    const k_taskbar = 9;
+    const k_dbus = 10;
+    const k_async = 11;
+    const k_fling = 12;
+    const k_search = 13;
+    const k_scrollbar = 14;
+    const k_kitty_anim = 15;
+    const k_compression = 16;
 
-    while (self.window.running and (!self.child_exited or self.hold)) {
+    var fds: std.ArrayList(posix.pollfd) = .empty;
+    defer fds.deinit(self.alloc);
+    try fds.appendSlice(self.alloc, &base);
+    const outgoing_start = fds.items.len;
+    try fds.appendNTimes(self.alloc, .{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 }, Clipboard.max_outgoing_transfers);
+    const tab_start = outgoing_start + Clipboard.max_outgoing_transfers;
+
+    while (self.window.running and (self.anyChildAlive() or self.hold)) {
+        // Tabs can appear or disappear while the loop waits: Ctrl+Shift+N runs
+        // from a key event dispatched below. Grow or trim the per-tab poll tail
+        // so the current tab set is wired before the next poll. poll ignores
+        // entries past `items.len`, so trimming drops stale closed pty fds.
+        const needed = tab_start + self.tabs.items.len * 2;
+        if (fds.items.len < needed) {
+            try fds.appendNTimes(self.alloc, .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 }, needed - fds.items.len);
+        }
+        fds.items.len = needed;
+
+        // Tab slots live at a fixed `tab_start` offset, so their indexes are
+        // stable; only the base references must be re-fetched after the backing
+        // array possibly grew above.
+        const wl_fd = &fds.items[k_wl];
+        const repeat_fd = &fds.items[k_repeat];
+        const paste_fd = &fds.items[k_paste];
+        const signal_fd = &fds.items[k_signal];
+        const sync_output_fd = &fds.items[k_sync_output];
+        const selection_autoscroll_fd = &fds.items[k_selection_autoscroll];
+        const copy_highlight_fd = &fds.items[k_copy_highlight];
+        const taskbar_progress_fd = &fds.items[k_taskbar];
+        const dbus_fd = &fds.items[k_dbus];
+        const async_fd = &fds.items[k_async];
+        const fling_fd = &fds.items[k_fling];
+        const search_fd = &fds.items[k_search];
+        const scrollbar_fd = &fds.items[k_scrollbar];
+        const kitty_animation_fd = &fds.items[k_kitty_anim];
+        const compression_fd = &fds.items[k_compression];
+        const outgoing_clipboard_fds = fds.items[outgoing_start..][0..Clipboard.max_outgoing_transfers];
+
         self.expireDbusRequests();
         self.expireClipboardTransfers();
         self.syncScrollbackCompression();
@@ -1673,6 +1697,20 @@ pub fn run(self: *App) !void {
             async_raster.complete_fd
         else
             -1;
+
+        // Wire each tab's pipeline (input) and, while it has a write
+        // backlog, its pty master (output) into the poll set.
+        const wired_tabs = self.tabs.items.len;
+        for (self.tabs.items, 0..) |tb, i| {
+            const pipe = &fds.items[tab_start + 2 * i];
+            const write = &fds.items[tab_start + 2 * i + 1];
+            pipe.fd = tb.pipeline.ready_fd;
+            pipe.events = posix.POLL.IN;
+            pipe.revents = 0;
+            write.fd = if (tb.write_queue.items.len > 0) tb.pty.master else -1;
+            write.events = posix.POLL.OUT;
+            write.revents = 0;
+        }
 
         // Standard libwayland read dance: drain the local queue, flush
         // requests, then sleep until one of the fds is ready.
@@ -1705,9 +1743,6 @@ pub fn run(self: *App) !void {
             },
         }
 
-        // Only poll the master while a write backlog exists, otherwise
-        // POLLOUT would make every poll return immediately.
-        pty_write_fd.fd = if (self.write_queue.items.len > 0) self.pty.master else -1;
         paste_fd.fd = self.clipboard.transferFd();
         self.clipboard.pollOutgoing(outgoing_clipboard_fds);
         dbus_fd.events = posix.POLL.IN;
@@ -1719,7 +1754,7 @@ pub fn run(self: *App) !void {
         const clipboard_timeout = self.clipboard.pollTimeoutMs();
         const dbus_timeout = self.dbusPollTimeoutMs();
         const timeout = if (clipboard_timeout < 0) dbus_timeout else if (dbus_timeout < 0) clipboard_timeout else @min(clipboard_timeout, dbus_timeout);
-        const ready = posix.poll(&fds, timeout) catch {
+        const ready = posix.poll(fds.items, timeout) catch {
             display.cancelRead();
             return error.PollFailed;
         };
@@ -1735,14 +1770,23 @@ pub fn run(self: *App) !void {
         self.syncTerminalVisibility();
 
         if (signal_fd.revents & posix.POLL.IN != 0) {
-            try self.drainSignals();
+            // Removing a tab shifts the poll slots below. Start over with a
+            // freshly wired set rather than apply this iteration's events to
+            // a different tab.
+            if (try self.drainSignals()) continue;
         }
 
-        if (pty_write_fd.revents & posix.POLL.OUT != 0) {
-            self.flushWriteQueue();
-        }
-        if (pipeline_fd.revents & posix.POLL.IN != 0) {
-            try self.drainPipeline();
+        // Per-tab pty output and input. Only tabs wired at the top of this
+        // iteration have poll data; a tab opened mid-iteration by a dispatched
+        // key event is not in the set, and a closed one was trimmed above.
+        for (self.tabs.items, 0..) |tb, i| {
+            if (i >= wired_tabs) break;
+            const pipe = &fds.items[tab_start + 2 * i];
+            const write = &fds.items[tab_start + 2 * i + 1];
+            if (write.revents & posix.POLL.OUT != 0) tb.flushWriteQueue();
+            if (pipe.revents & posix.POLL.IN != 0) {
+                try self.drainTab(tb);
+            }
         }
 
         if (repeat_fd.revents & posix.POLL.IN != 0) {
@@ -1798,6 +1842,10 @@ pub fn run(self: *App) !void {
                 self.finishAsyncRender();
         }
 
+        // Free closed tabs once their children have been reaped and the raster
+        // worker is no longer borrowing their kitty image cache.
+        self.drainPendingCleanup();
+
         self.clipboard.dispatchOutgoing(outgoing_clipboard_fds);
         if (self.clipboard.transferFd() >= 0 and paste_fd.fd == self.clipboard.transferFd() and
             paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0)
@@ -1820,29 +1868,30 @@ pub fn run(self: *App) !void {
         return error.WindowFatal;
     }
 
-    // Window closed while the child is alive: hang it up like a real
+    // Window closed while children are alive: hang them up like a real
     // terminal whose master side went away. Do not synchronously wait
     // here: shells can wait on foreground jobs that still hold the
     // slave side open, which would wedge the terminal process.
-    if (!self.child_exited) {
+    if (self.anyChildAlive()) {
         self.hangupChild();
     }
 }
 
-fn hangupChild(self: *App) void {
-    // The gather thread must be joined before the master can be closed;
-    // stop() is idempotent and deinit covers the child-exited path.
-    self.pipeline.stop();
-    if (self.child_exited) {
-        return;
+fn anyChildAlive(self: *const App) bool {
+    for (self.tabs.items) |tb| {
+        if (!tb.child_exited) return true;
     }
-    self.pty.closeMaster();
-    _ = std.os.linux.kill(self.child_pid, std.os.linux.SIG.HUP);
+    return false;
+}
+
+fn hangupChild(self: *App) void {
+    for (self.tabs.items) |tb| tb.hangup();
 }
 
 /// Signal events arrived. SIGCHLD is the only place the terminal decides
 /// the session is over; SIGUSR1 reloads process-local configuration.
-fn drainSignals(self: *App) !void {
+/// Drains process signals and returns whether reaping removed a tab.
+fn drainSignals(self: *App) !bool {
     var info: std.os.linux.signalfd_siginfo = undefined;
     var saw_sigchld = false;
     var saw_sigusr1 = false;
@@ -1856,26 +1905,170 @@ fn drainSignals(self: *App) !void {
         }
     }
     if (saw_sigusr1) self.reloadConfig();
+    var removed_tab = false;
     if (saw_sigchld) {
-        if (try Pty.tryWait(self.child_pid)) |status| {
-            log.debug("child exited with status {d}", .{status});
-            self.child_exited = true;
-            try self.finishChildOutput();
+        // Reap each exited session, then remove its tab. `orderedRemove`
+        // shifts the following tab into this index, so do not advance it.
+        var i: usize = 0;
+        while (i < self.tabs.items.len) {
+            const tb = self.tabs.items[i];
+            if (try tb.tryWait()) {
+                try self.finishChildOutput(tb);
+                if (self.removeExitedTab(i)) {
+                    removed_tab = true;
+                    continue;
+                }
+            }
+            i += 1;
         }
+        // Manually closed tabs no longer participate in rendering or input,
+        // but their Tab remains queued until wait4 consumes the child status.
+        // Reap them on the same SIGCHLD edge as visible sessions.
+        try self.reapPendingTabChildren();
     }
+    return removed_tab;
+}
+
+/// Reap children belonging to tabs removed explicitly by the user. Their
+/// pipelines are already stopped and their PTY masters closed, so no terminal
+/// output remains to drain.
+fn reapPendingTabChildren(self: *App) !void {
+    for (self.pending_tab_cleanup.items) |closing| {
+        _ = try closing.tryWait();
+    }
+}
+
+test "children of manually closed tabs remain tracked until reaped" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) linux.exit(0);
+
+    const tb = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(tb);
+    tb.child_pid = @intCast(fork_rc);
+
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.pending_tab_cleanup = .empty;
+    defer app.pending_tab_cleanup.deinit(alloc);
+    try app.pending_tab_cleanup.append(alloc, tb);
+
+    // wait4(WNOHANG) may race the newly forked child. Keep exercising the same
+    // nonblocking event-loop path until the scheduler publishes its exit.
+    for (0..100_000) |_| {
+        try app.reapPendingTabChildren();
+        if (tb.child_exited) break;
+    }
+    if (!tb.child_exited) {
+        _ = linux.kill(tb.child_pid, linux.SIG.KILL);
+        _ = Pty.wait(tb.child_pid) catch {};
+    }
+    try std.testing.expect(tb.child_exited);
+    app.pending_tab_cleanup.clearRetainingCapacity();
 }
 
 /// Once wait4 confirms the session child is gone, join the gatherer, consume
 /// everything it published, then drain bytes it had not yet read from the
 /// nonblocking master before ending the session.
-fn finishChildOutput(self: *App) !void {
-    self.pipeline.stop();
-    try self.drainPipeline();
-    const consumed = try drainPtyTail(self.pty.master, &self.stream);
+/// Once wait4 confirms this tab's session child is gone, join its gatherer,
+/// consume everything it published, then drain bytes it had not yet read
+/// from the nonblocking master before ending the session.
+fn finishChildOutput(self: *App, tb: *Tab) !void {
+    tb.pipeline.stop();
+    try self.drainTab(tb);
+    const consumed = try drainPtyTail(tb.pty.master, &tb.stream);
     if (consumed) {
         self.needs_redraw = true;
-        self.syncPtyOutput(true);
+        if (tb == self.active) self.syncPtyOutput(tb, true);
     }
+}
+
+/// Handles a reaped session after its final PTY bytes have been consumed.
+/// Returns whether the tab was removed. Hold mode retains the terminal;
+/// otherwise the last session closes the window, or a neighbor becomes active.
+fn removeExitedTab(self: *App, idx: usize) bool {
+    std.debug.assert(idx < self.tabs.items.len);
+    std.debug.assert(self.tabs.items[idx].child_exited);
+    if (self.hold) {
+        const tb = self.tabs.items[idx];
+        // The child cannot finish a synchronized batch after exiting. Show
+        // its final output even if it left DEC 2026 enabled.
+        tb.term.modes.set(.synchronized_output, false);
+        tb.sync_output_deadline_ns = null;
+        self.armSyncOutputTimer(self.nowNs());
+        self.requestFullAsyncRedraw();
+        return false;
+    }
+    if (self.tabs.items.len == 1) {
+        const closing = self.tabs.orderedRemove(idx);
+        self.disposeClosedTab(closing);
+        self.window.running = false;
+        return true;
+    }
+
+    if (self.tabs.items[idx] == self.active) {
+        if (idx + 1 < self.tabs.items.len) {
+            self.activateIndex(idx + 1);
+        } else {
+            self.activateIndex(idx - 1);
+        }
+    }
+    const closing = self.tabs.orderedRemove(idx);
+    self.disposeClosedTab(closing);
+    log.debug("session exited; closed tab ({d} remaining)", .{self.tabs.items.len});
+    self.requestFullAsyncRedraw();
+    return true;
+}
+
+test "hold retains exited tabs and exposes their final synchronized output" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    const window = try alloc.create(Window);
+    defer alloc.destroy(window);
+    window.running = true;
+    app.window = window;
+    app.io = std.testing.io;
+    app.hold = true;
+    app.async_generation = 0;
+    app.held_frame = null;
+    app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    app.sync_output_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.sync_output_fd);
+    const a = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(a);
+    const b = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(b);
+    const tabs = [_]*Tab{ a, b };
+    for (tabs) |tb| {
+        tb.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 1 });
+        try tb.term.printString("final");
+        tb.child_exited = true;
+        tb.term.modes.set(.synchronized_output, true);
+    }
+    defer for (tabs) |tb| tb.term.deinit(alloc);
+    try app.tabs.appendSlice(alloc, &tabs);
+    app.active = b;
+    try std.testing.expect(!app.removeExitedTab(0));
+    try std.testing.expect(!app.removeExitedTab(1));
+    try std.testing.expectEqual(@as(usize, 2), app.tabs.items.len);
+    try std.testing.expect(app.active == b);
+    try std.testing.expect(window.running);
+    for (tabs) |tb| {
+        try std.testing.expect(!tb.term.modes.get(.synchronized_output));
+        const contents = try tb.term.plainString(alloc);
+        defer alloc.free(contents);
+        try std.testing.expectEqualStrings("final", std.mem.trimEnd(u8, contents, "\n "));
+    }
+    app.tabs.items.len = 1;
+    app.active = a;
+    try std.testing.expect(!app.removeExitedTab(0));
+    try std.testing.expectEqual(@as(usize, 1), app.tabs.items.len);
+    try std.testing.expect(window.running);
+    try std.testing.expect(app.needs_redraw);
 }
 
 fn reloadConfig(self: *App) void {
@@ -1910,16 +2103,254 @@ fn reloadConfig(self: *App) void {
     log.info("config reloaded", .{});
 }
 
-/// Ctrl+Shift+N: spawn an independent monstar window in the shell's
-/// current directory through the user service manager so the new window
-/// is not adopted by this monstar's launcher.
+fn activeIndex(self: *const App) usize {
+    for (self.tabs.items, 0..) |t, i| if (t == self.active) return i;
+    unreachable;
+}
+
+/// Ctrl+Shift+N: open a new session. In tab mode (default) a new tab starts
+/// in the current tab's working directory; in window mode an independent
+/// window is spawned through the user service manager.
+fn openNewSession(self: *App) void {
+    if (self.config.new_window_mode == .window) {
+        self.spawnNewWindow();
+    } else {
+        self.newTab();
+    }
+}
+
+/// The active tab's directory, mirroring kitty: its OSC 7 report when present
+/// and valid, else the shell process's real cwd from /proc so sessions without
+/// shell integration still inherit the right directory. Returns null when the
+/// directory no longer exists, so the caller inherits this process's cwd.
+fn activeTabPwd(self: *App, arena: std.mem.Allocator) std.mem.Allocator.Error!?[:0]const u8 {
+    if (self.tab().term.getPwd()) |url| {
+        if (try clipboard_format.osc7Path(arena, url)) |path| {
+            if (self.isDirectory(path)) return path;
+        }
+    }
+
+    var proc_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const proc_path = std.fmt.bufPrint(&proc_buf, "/proc/{d}/cwd", .{self.tab().child_pid}) catch return null;
+    var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = std.Io.Dir.readLinkAbsolute(self.io, proc_path, &link_buf) catch return null;
+    const link = link_buf[0..len];
+    // readlink appends " (deleted)" once the directory is unlinked.
+    if (std.mem.endsWith(u8, link, " (deleted)")) return null;
+    if (!self.isDirectory(link)) return null;
+    return try arena.dupeZ(u8, link);
+}
+
+fn isDirectory(self: *App, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return false;
+    return stat.kind == .directory;
+}
+
+/// Ctrl+Shift+T (and Ctrl+Shift+N in tab mode): start a new session tab in
+/// the current tab's working directory and switch to it.
+fn newTab(self: *App) void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pwd: ?[:0]const u8 = self.activeTabPwd(arena) catch null;
+    const envp = sessionEnvp(arena, self.child_envp, pwd) catch |err| {
+        log.err("new tab env setup failed: {}", .{err});
+        return;
+    };
+
+    const tb = Tab.init(
+        self.alloc,
+        self.io,
+        self,
+        self.next_tab_id,
+        self.config,
+        self.environ,
+        self.child_path,
+        self.child_argv,
+        envp,
+        .{
+            .cols = self.tab().term.cols,
+            .rows = self.tab().term.rows,
+            .cell_width = self.font.cell_width,
+            .cell_height = self.font.cell_height,
+            .working_directory = pwd orelse self.working_directory,
+            .color_scheme = self.color_scheme,
+        },
+    ) catch |err| {
+        log.err("new tab spawn failed: {}", .{err});
+        return;
+    };
+    self.next_tab_id += 1;
+    // A new tab needs the response/side-effect handlers, not just the default
+    // readonly ones, so its device queries, size reports and PTY replies reach
+    // its own pty.
+    self.installEffects(tb);
+    tb.start() catch |err| {
+        log.err("new tab pipeline start failed: {}", .{err});
+        tb.deinit();
+        return;
+    };
+
+    self.tabs.append(self.alloc, tb) catch |err| {
+        log.err("new tab list grow failed: {}", .{err});
+        tb.deinit();
+        return;
+    };
+    if (tb.term.getTitle()) |title| self.window.toplevel.setTitle(title.ptr);
+    log.debug("opened new tab ({d})", .{self.tabs.items.len});
+    self.activateTab(tb);
+}
+
+fn activateTab(self: *App, tb: *Tab) void {
+    if (tb == self.active) return;
+    self.cancelDrag();
+    self.cancelLinkPress();
+    self.clearSelection();
+    self.stopFling();
+    self.hideScrollbar();
+    self.clearImeText();
+    self.active = tb;
+    // Every tab shares the window geometry; make sure the newly-active
+    // terminal matches the current grid and force a full repaint.
+    self.render_state.rows = 0;
+    self.render_state.dirty = .full;
+    self.async_force_full = true;
+    self.hovered_link = null;
+    self.link_checked_cell = null;
+    self.link_active = false;
+    self.needs_redraw = true;
+    self.syncActiveScreen(tb);
+    self.syncSynchronizedOutput(tb);
+    self.syncInBandSizeReports(tb);
+    self.requestFullAsyncRedraw();
+    if (tb.term.getTitle()) |title| self.window.toplevel.setTitle(title.ptr);
+}
+
+fn activateIndex(self: *App, index: usize) void {
+    self.activateTab(self.tabs.items[index]);
+}
+
+/// Returns a live tab by its stable asynchronous-operation identity.
+fn findTab(self: *App, id: u64) ?*Tab {
+    for (self.tabs.items) |tb| if (tb.id == id) return tb;
+    return null;
+}
+
+fn nextTab(self: *App) void {
+    self.activateIndex((self.activeIndex() + 1) % self.tabs.items.len);
+}
+
+fn prevTab(self: *App) void {
+    const len = self.tabs.items.len;
+    self.activateIndex((self.activeIndex() + len - 1) % len);
+}
+
+/// Ctrl+Shift+, / Ctrl+Shift+.: move the active tab one slot left or right in
+/// the strip. The tab stays active; a no-op at either end.
+fn moveTab(self: *App, direction: isize) void {
+    const len: isize = @intCast(self.tabs.items.len);
+    if (len < 2) return;
+    const idx: isize = @intCast(self.activeIndex());
+    const target = idx + direction;
+    if (target < 0 or target >= len) return;
+    std.mem.swap(*Tab, &self.tabs.items[@intCast(idx)], &self.tabs.items[@intCast(target)]);
+    self.requestFullAsyncRedraw();
+}
+
+/// Ctrl+Shift+W/Q: close the active tab, activating a neighbor. Closing the
+/// last tab closes the window. A live child is hung up immediately, while its
+/// tab state is retained until SIGCHLD lets the event loop reap it.
+fn closeTab(self: *App) void {
+    self.closeTabAt(self.activeIndex());
+}
+
+fn closeTabAt(self: *App, idx: usize) void {
+    std.debug.assert(idx < self.tabs.items.len);
+    if (self.tabs.items.len <= 1) {
+        self.tabs.items[idx].hangup();
+        self.window.running = false;
+        return;
+    }
+    // Once removed from `tabs`, a live child's PID is reachable only through
+    // the cleanup queue. Reserve before changing visible state so OOM cannot
+    // turn the child into an untracked zombie.
+    self.pending_tab_cleanup.ensureUnusedCapacity(self.alloc, 1) catch |err| {
+        log.warn("cannot close tab: failed to reserve child cleanup ({})", .{err});
+        return;
+    };
+    if (self.tabs.items[idx] == self.active) {
+        if (idx + 1 < self.tabs.items.len) {
+            self.activateIndex(idx + 1);
+        } else {
+            self.activateIndex(idx - 1);
+        }
+    }
+    const closing = self.tabs.orderedRemove(idx);
+    // Stop the child immediately. Only cache/terminal destruction may wait
+    // for a raster snapshot; clipboard completions use the stable tab ID and
+    // will be discarded once this tab is absent from `tabs`.
+    closing.hangup();
+    if (closing.child_exited) {
+        self.disposeClosedTab(closing);
+    } else {
+        self.pending_tab_cleanup.appendAssumeCapacity(closing);
+    }
+    log.debug("closed tab ({d} remaining)", .{self.tabs.items.len});
+    self.requestFullAsyncRedraw();
+}
+
+/// Releases a removed tab now, unless the async raster worker still borrows
+/// its kitty cache through the current snapshot.
+fn disposeClosedTab(self: *App, closing: *Tab) void {
+    std.debug.assert(closing.child_exited);
+    // Defer deinit while the raster worker is busy or the snapshot still pins
+    // this tab's kitty cache. A deferred tab stays alive so the cache pointer
+    // in the snapshot remains valid until it is released.
+    const snapshot_pins = self.async_job.kitty_cache == &closing.kitty_cache;
+    const busy = self.async_raster != null and self.async_raster.?.busy();
+    if (!busy and !snapshot_pins) {
+        closing.deinit();
+    } else {
+        self.pending_tab_cleanup.append(self.alloc, closing) catch |err| {
+            // Out of memory. When the snapshot still pins this tab's cache,
+            // freeing the tab would leave a dangling cache pointer, so leak it
+            // rather than risk a use-after-free.
+            if (snapshot_pins) {
+                log.warn("out of memory deferring closed tab cleanup ({}); leaking a tab", .{err});
+            } else {
+                closing.deinit();
+            }
+        };
+    }
+}
+
+/// Deinit queued closed tabs once their children are reaped, the raster worker
+/// is idle, and the snapshot no longer pins their kitty cache.
+fn drainPendingCleanup(self: *App) void {
+    const busy = if (self.async_raster) |*async_raster| async_raster.busy() else false;
+    var i: usize = 0;
+    while (i < self.pending_tab_cleanup.items.len) {
+        const closing = self.pending_tab_cleanup.items[i];
+        if (!closing.child_exited or busy or self.async_job.kitty_cache == &closing.kitty_cache) {
+            i += 1;
+            continue;
+        }
+        _ = self.pending_tab_cleanup.swapRemove(i);
+        closing.deinit();
+    }
+}
+
+/// Ctrl+Shift+N (window mode): spawn an independent monstar window in the
+/// shell's current directory through the user service manager so the new
+/// window is not adopted by this monstar's launcher.
 fn spawnNewWindow(self: *App) void {
     var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const pwd: ?[:0]const u8 = pwd: {
-        const url = self.term.getPwd() orelse break :pwd null;
+        const url = self.tab().term.getPwd() orelse break :pwd null;
         break :pwd clipboard_format.osc7Path(arena, url) catch null;
     };
 
@@ -2076,7 +2507,7 @@ pub fn resolveCommandPathZ(
 
 /// Ctrl+Shift+Z/X: move the scrollback viewport between OSC 133 prompt marks.
 fn jumpPrompt(self: *App, delta: isize) void {
-    const screen = self.term.screens.active;
+    const screen = self.tab().term.screens.active;
     if (!screen.semantic_prompt.seen) return;
     screen.pages.scroll(.{ .delta_prompt = delta });
     self.revealScrollbar();
@@ -2097,7 +2528,7 @@ fn pipeCommandOutput(self: *App) void {
     const arena = arena_state.allocator();
 
     const pwd: ?[:0]const u8 = pwd: {
-        const url = self.term.getPwd() orelse break :pwd null;
+        const url = self.tab().term.getPwd() orelse break :pwd null;
         break :pwd clipboard_format.osc7Path(arena, url) catch null;
     };
     const envp = self.spawnEnvp(arena, pwd, null) catch |err| {
@@ -2109,7 +2540,7 @@ fn pipeCommandOutput(self: *App) void {
 }
 
 fn lastCommandOutput(self: *App) ?[:0]const u8 {
-    return semanticCommandOutputText(self.alloc, self.term.screens.active);
+    return semanticCommandOutputText(self.alloc, self.tab().term.screens.active);
 }
 
 fn semanticCommandOutputText(alloc: std.mem.Allocator, screen: *vt.Screen) ?[:0]const u8 {
@@ -2231,14 +2662,24 @@ fn spawnEnvp(
     activation_token: ?[:0]const u8,
 ) ![*:null]const ?[*:0]const u8 {
     var list: std.ArrayList(?[*:0]const u8) = .empty;
+    var has_terminfo = false;
     for (self.environ.block.slice) |entry| {
         const e = entry orelse continue;
-        if (pwd != null and std.mem.startsWith(u8, std.mem.span(e), "PWD=")) continue;
+        const value = std.mem.span(e);
+        // Reflect monstar's terminal definition, not whatever environ we were
+        // launched with. Without TERM/COLORTERM/TERMINFO a freshly-spawned
+        // shell is not a proper interactive monstar session.
+        if (std.mem.startsWith(u8, value, "TERM=")) continue;
+        if (std.mem.startsWith(u8, value, "COLORTERM=")) continue;
+        if (std.mem.startsWith(u8, value, "TERMINFO=")) has_terminfo = true;
+        if (pwd != null and std.mem.startsWith(u8, value, "PWD=")) continue;
         // Activation tokens are single-use and must not leak from the process
         // that launched us into unrelated children.
-        if (std.mem.startsWith(u8, std.mem.span(e), "XDG_ACTIVATION_TOKEN=")) continue;
+        if (std.mem.startsWith(u8, value, "XDG_ACTIVATION_TOKEN=")) continue;
         try list.append(arena, e);
     }
+    try list.append(arena, "TERM=monstar");
+    try list.append(arena, "COLORTERM=truecolor");
     if (pwd) |p| {
         const entry = try std.mem.joinZ(arena, "", &.{ "PWD=", p });
         try list.append(arena, entry.ptr);
@@ -2247,8 +2688,61 @@ fn spawnEnvp(
         const entry = try std.mem.joinZ(arena, "", &.{ "XDG_ACTIVATION_TOKEN=", token });
         try list.append(arena, entry.ptr);
     }
+    if (!has_terminfo) {
+        var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.process.executableDirPath(self.io, &exe_dir_buf)) |len| {
+            const terminfo_dir = try std.fs.path.joinZ(arena, &.{ exe_dir_buf[0..len], "..", "share", "terminfo" });
+            const entry = try std.fs.path.joinZ(arena, &.{ terminfo_dir, "m", "monstar" });
+            if (std.os.linux.errno(std.os.linux.access(entry, std.os.linux.R_OK)) == .SUCCESS) {
+                try list.append(arena, try std.mem.joinZ(arena, "", &.{ "TERMINFO=", terminfo_dir }));
+            }
+        } else |_| {}
+    }
     const slice = try list.toOwnedSliceSentinel(arena, null);
     return slice.ptr;
+}
+
+/// Clone the prepared session environment for another tab, replacing PWD when
+/// the active tab provides one. Shell integration variables live only in this
+/// environment (not `App.environ`) and must accompany the reused session
+/// command; in particular, bash's injected `--posix` requires its `ENV` script.
+fn sessionEnvp(
+    arena: std.mem.Allocator,
+    base: [*:null]const ?[*:0]const u8,
+    pwd: ?[:0]const u8,
+) ![*:null]const ?[*:0]const u8 {
+    var list: std.ArrayList(?[*:0]const u8) = .empty;
+    var i: usize = 0;
+    while (base[i]) |entry| : (i += 1) {
+        if (pwd != null and std.mem.startsWith(u8, std.mem.span(entry), "PWD=")) continue;
+        try list.append(arena, entry);
+    }
+    if (pwd) |value| {
+        const entry = try std.mem.joinZ(arena, "", &.{ "PWD=", value });
+        try list.append(arena, entry.ptr);
+    }
+    const slice = try list.toOwnedSliceSentinel(arena, null);
+    return slice.ptr;
+}
+
+test "new tab session environment preserves bash injection and replaces PWD" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const base = [_:null]?[*:0]const u8{
+        "ENV=/share/monstar/shell-integration/bash/monstar.bash",
+        "MONSTAR_BASH_INJECT=1",
+        "PWD=/old",
+        "TERM=monstar",
+    };
+    const envp = try sessionEnvp(arena, &base, "/new");
+
+    try std.testing.expectEqualStrings("ENV=/share/monstar/shell-integration/bash/monstar.bash", std.mem.span(envp[0].?));
+    try std.testing.expectEqualStrings("MONSTAR_BASH_INJECT=1", std.mem.span(envp[1].?));
+    try std.testing.expectEqualStrings("TERM=monstar", std.mem.span(envp[2].?));
+    try std.testing.expectEqualStrings("PWD=/new", std.mem.span(envp[3].?));
+    try std.testing.expect(envp[4] == null);
 }
 
 fn applyConfig(self: *App, new_config: Config) !void {
@@ -2264,10 +2758,6 @@ fn applyConfig(self: *App, new_config: Config) !void {
     self.window.setBufferAlpha(new_config.background_opacity < 255);
     self.window.setBackgroundBlur(new_config.background_blur and new_config.background_opacity < 255);
     self.window.toplevel.setAppId(new_config.app_id);
-
-    if (new_config.image_storage_limit != self.config.image_storage_limit) {
-        self.term.setKittyGraphicsSizeLimit(self.alloc, new_config.image_storage_limit);
-    }
 
     // Always rebuild the Font on config reload so a reload also picks up
     // fontconfig/file changes for the same family name. The resize path is
@@ -2295,11 +2785,7 @@ fn applyColorDefaults(self: *App) void {
 }
 
 fn applyColorDefaultsForConfig(self: *App, config: Config) void {
-    const colors = config.terminalColors(self.color_scheme);
-    self.term.colors.background.default = colors.background.default;
-    self.term.colors.foreground.default = colors.foreground.default;
-    self.term.colors.cursor.default = colors.cursor.default;
-    self.term.colors.palette.changeDefault(colors.palette.original);
+    for (self.tabs.items) |tb| tb.applyConfig(config, self.color_scheme);
 
     self.selection_bg = colorWithRuntimeOverride(
         config.effectiveSelectionBackground(self.color_scheme),
@@ -2313,6 +2799,110 @@ fn applyColorDefaultsForConfig(self: *App, config: Config) void {
     self.copy_highlight_fg = config.effectiveCopyHighlightForeground(self.color_scheme);
     self.cursor_color = config.effectiveCursorColor(self.color_scheme);
     self.cursor_text = config.effectiveCursorText(self.color_scheme);
+}
+
+test "theme and configuration updates reach background tabs and preserve OSC overrides" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.config = .{};
+    app.color_scheme = .dark;
+    app.selection_bg_override = null;
+    app.selection_fg_override = null;
+    app.async_generation = 0;
+    app.held_frame = null;
+    app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    const a = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(a);
+    const b = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(b);
+    const tabs = [_]*Tab{ a, b };
+    for (tabs) |tb| {
+        tb.term = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+        tb.term.modes.set(.report_color_scheme, true);
+        try tb.write_queue.append(alloc, 0);
+    }
+    defer for (tabs) |tb| {
+        tb.term.deinit(alloc);
+        tb.write_queue.deinit(alloc);
+    };
+    try app.tabs.appendSlice(alloc, &tabs);
+    app.active = a;
+    const runtime: vt.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    b.term.colors.background.set(runtime);
+    app.setColorScheme(.light, true);
+    const light = app.config.terminalColors(.light);
+    for (tabs) |tb| {
+        try std.testing.expectEqual(light.background.default, tb.term.colors.background.default);
+        try std.testing.expectEqual(light.foreground.default, tb.term.colors.foreground.default);
+        try std.testing.expectEqualSlices(vt.color.RGB, &light.palette.original, &tb.term.colors.palette.original);
+        try std.testing.expectEqualStrings("\x00\x1b[?997;2n", tb.write_queue.items);
+    }
+    const new_config: Config = .{ .background = .{ .r = 20, .g = 30, .b = 40 }, .image_storage_limit = 1234 };
+    app.applyColorDefaultsForConfig(new_config);
+    for (tabs) |tb| {
+        try std.testing.expectEqual(new_config.background, tb.term.colors.background.default);
+        try std.testing.expectEqual(@as(usize, 1234), tb.term.screens.active.kitty_images.total_limit);
+    }
+    try std.testing.expectEqual(runtime, b.term.colors.background.get().?);
+}
+
+test "resize reports DEC 2048 size to the tab that enabled it" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var out_a: [2]posix.fd_t = undefined;
+    var out_b: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&out_a, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(out_a[0]);
+    defer _ = linux.close(out_a[1]);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&out_b, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(out_b[0]);
+    defer _ = linux.close(out_b[1]);
+
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.font = undefined;
+    app.font.cell_width = 10;
+    app.font.cell_height = 20;
+
+    const a = pipeBackedTab(alloc, out_a[1]);
+    defer alloc.destroy(a);
+    defer a.write_queue.deinit(alloc);
+    a.id = 1;
+    a.term = try .init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer a.term.deinit(alloc);
+    const b = pipeBackedTab(alloc, out_b[1]);
+    defer alloc.destroy(b);
+    defer b.write_queue.deinit(alloc);
+    b.id = 2;
+    b.term = try .init(std.testing.io, alloc, .{ .cols = 80, .rows = 24 });
+    defer b.term.deinit(alloc);
+
+    // Only tab A enables DEC 2048 in-band size reports; a resize must push a
+    // report to A's pty alone, reaching its own master/slave pair.
+    a.term.modes.set(.in_band_size_reports, true);
+    app.notifyTabResize(a);
+    app.notifyTabResize(b);
+
+    var buf: [64]u8 = undefined;
+    var expected: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&expected);
+    try vt.size_report.encode(&writer, .mode_2048, .{
+        .rows = 24,
+        .columns = 80,
+        .cell_width = 10,
+        .cell_height = 20,
+    });
+    const n = try posix.read(out_a[0], &buf);
+    try std.testing.expectEqualStrings(writer.buffered(), buf[0..n]);
+    try std.testing.expectError(error.WouldBlock, posix.read(out_b[0], &buf));
+
+    // Disabling the mode stops future reports to A.
+    a.term.modes.set(.in_band_size_reports, false);
+    app.notifyTabResize(a);
+    try std.testing.expectError(error.WouldBlock, posix.read(out_a[0], &buf));
 }
 
 fn selectionBackgroundForRender(self: *const App) vt.color.RGB {
@@ -2390,29 +2980,32 @@ fn resetRuntimeFontSize(self: *App) void {
 ///
 /// The master can never return EIO/EOF because Pty.spawn retains a
 /// slave fd in this process; only SIGCHLD ends the session.
-fn drainPipeline(self: *App) !void {
-    self.pipeline.clearReady();
+fn drainTab(self: *App, tb: *Tab) !void {
+    tb.pipeline.clearReady();
     var consumed = false;
     for (0..ReadPipeline.buffer_count) |_| {
-        const batch = self.pipeline.take() orelse break;
-        self.stream.nextSlice(batch);
-        self.pipeline.release();
+        const batch = tb.pipeline.take() orelse break;
+        tb.stream.nextSlice(batch);
+        tb.pipeline.release();
         consumed = true;
         self.needs_redraw = true;
     }
-    self.pipeline.rearm();
-    if (self.pipeline.hasFailed()) return error.PtyReadFailed;
-    self.syncPtyOutput(consumed);
+    tb.pipeline.rearm();
+    if (tb.pipeline.hasFailed()) return error.PtyReadFailed;
+    self.syncPtyOutput(tb, consumed);
 }
 
-fn syncPtyOutput(self: *App, consumed: bool) void {
-    self.syncInBandSizeReports();
-    self.syncSynchronizedOutput();
+fn syncPtyOutput(self: *App, tb: *Tab, consumed: bool) void {
+    self.syncInBandSizeReports(tb);
+    self.syncSynchronizedOutput(tb);
     self.syncScrollTarget();
-    self.syncActiveScreen();
-    self.syncScrollbarHover();
-    if (consumed) self.refreshSearch();
-    if (consumed) self.syncHoveredLink(true);
+    self.syncActiveScreen(tb);
+    if (consumed) self.refreshSearch(tb);
+    // Pointer-driven overlays only apply to the visible tab.
+    if (tb == self.active) {
+        self.syncScrollbarHover();
+        if (consumed) self.syncHoveredLink(true);
+    }
 }
 
 fn drainPtyTail(fd: posix.fd_t, stream: anytype) !bool {
@@ -2432,6 +3025,7 @@ fn drainPtyTail(fd: posix.fd_t, stream: anytype) !bool {
 
 fn handleOscColorOperation(
     self: *App,
+    tb: *Tab,
     requests: *const vt.osc.color.List,
     terminator: vt.osc.Terminator,
 ) void {
@@ -2439,7 +3033,7 @@ fn handleOscColorOperation(
     while (it.next()) |req| {
         switch (req.*) {
             .set => |set| self.setOscColor(set),
-            .query => |target| self.answerOscSelectionColorQuery(target, terminator),
+            .query => |target| self.answerOscSelectionColorQuery(tb, target, terminator),
             .reset => |target| self.resetOscColor(target),
             else => {},
         }
@@ -2482,7 +3076,7 @@ fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
     self.requestFullAsyncRedraw();
 }
 
-fn answerKittySelectionColorQueries(self: *App, request: vt.kitty.color.OSC) void {
+fn answerKittySelectionColorQueries(self: *App, tb: *Tab, request: vt.kitty.color.OSC) void {
     var writer: std.Io.Writer.Allocating = .init(self.alloc);
     defer writer.deinit();
 
@@ -2491,7 +3085,7 @@ fn answerKittySelectionColorQueries(self: *App, request: vt.kitty.color.OSC) voi
 
     const response = writer.toOwnedSlice() catch return;
     defer self.alloc.free(response);
-    self.writePty(response);
+    tb.writePty(response);
 }
 
 fn formatKittySelectionColorResponse(
@@ -2558,9 +3152,9 @@ fn writeKittyColorValue(writer: *std.Io.Writer, color: vt.color.RGB) !void {
     try writer.print("rgb:{x:0>2}/{x:0>2}/{x:0>2}", .{ color.r, color.g, color.b });
 }
 
-fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
+fn setOsc52Clipboard(self: *App, tb: *Tab, kind: u8, data: []const u8) void {
     if (data.len == 1 and data[0] == '?') {
-        self.beginOsc52Read(kind);
+        self.beginOsc52Read(tb, kind);
         return;
     }
 
@@ -2578,24 +3172,24 @@ fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
     }
 }
 
-fn beginOsc52Read(self: *App, kind: u8) void {
+fn beginOsc52Read(self: *App, tb: *Tab, kind: u8) void {
     const target: Clipboard.Target = switch (osc52Target(kind)) {
         .clipboard => .clipboard,
         .primary => .primary,
     };
-    switch (self.clipboard.request(target, .{ .osc52_read = kind })) {
+    switch (self.clipboard.request(target, .{ .osc52_read = .{ .tab_id = tb.id, .kind = kind } })) {
         .started => {},
-        .busy, .unavailable => self.writeOsc52ClipboardReport(kind, ""),
+        .busy, .unavailable => self.writeOsc52ClipboardReport(tb, kind, ""),
     }
 }
 
-fn writeOsc52ClipboardReport(self: *App, kind: u8, data: []const u8) void {
+fn writeOsc52ClipboardReport(self: *App, tb: *Tab, kind: u8, data: []const u8) void {
     var writer: std.Io.Writer.Allocating = .init(self.alloc);
     defer writer.deinit();
     formatOsc52ClipboardReport(&writer.writer, kind, data) catch return;
     const response = writer.toOwnedSlice() catch return;
     defer self.alloc.free(response);
-    self.writePty(response);
+    tb.writePty(response);
 }
 
 fn formatOsc52ClipboardReport(writer: *std.Io.Writer, kind: u8, data: []const u8) !void {
@@ -2632,14 +3226,16 @@ fn decodeOsc52ClipboardData(alloc: std.mem.Allocator, data: []const u8) ![:0]con
 
 fn answerOscSelectionColorQuery(
     self: *App,
+    tb: *Tab,
     target: vt.osc.color.Target,
     terminator: vt.osc.Terminator,
 ) void {
     switch (target) {
         .palette => {},
         .dynamic => |dynamic| switch (dynamic) {
-            .highlight_background => self.writeOscDynamicReport(17, self.selection_bg, terminator),
+            .highlight_background => self.writeOscDynamicReport(tb, 17, self.selection_bg, terminator),
             .highlight_foreground => self.writeOscDynamicReport(
+                tb,
                 19,
                 self.selection_fg orelse self.effectiveForeground(),
                 terminator,
@@ -2660,11 +3256,12 @@ fn answerOscSelectionColorQuery(
 
 fn writeOscDynamicReport(
     self: *App,
+    tb: *Tab,
     dynamic: u16,
     color: vt.color.RGB,
     terminator: vt.osc.Terminator,
 ) void {
-    self.writeOscColorReport(.{ .dynamic = dynamic }, color, terminator);
+    self.writeOscColorReport(tb, .{ .dynamic = dynamic }, color, terminator);
 }
 
 const OscColorReport = union(enum) {
@@ -2673,7 +3270,8 @@ const OscColorReport = union(enum) {
 };
 
 fn writeOscColorReport(
-    self: *App,
+    _: *App,
+    tb: *Tab,
     report: OscColorReport,
     color: vt.color.RGB,
     terminator: vt.osc.Terminator,
@@ -2681,7 +3279,7 @@ fn writeOscColorReport(
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     formatOscColorReport(&writer, report, color, terminator) catch return;
-    self.writePty(writer.buffered());
+    tb.writePty(writer.buffered());
 }
 
 fn formatOscColorReport(
@@ -2714,7 +3312,7 @@ fn formatOscColorReport(
 }
 
 fn effectiveForeground(self: *const App) vt.color.RGB {
-    return self.term.colors.foreground.get() orelse self.term.colors.palette.current[7];
+    return self.tab().term.colors.foreground.get() orelse self.tab().term.colors.palette.current[7];
 }
 
 fn syncCursorShape(self: *App) void {
@@ -2722,10 +3320,11 @@ fn syncCursorShape(self: *App) void {
 }
 
 fn currentCursorShape(self: *App) Window.CursorShape {
+    if (self.pointerInTabBar()) return .pointer;
     if (self.scrollbar_hovered or self.scrollbar_drag != null or self.scrollbarThumbHit() != null) return .default;
     if (self.hoveredLinkUri() != null) return .pointer;
-    if (self.mouse_shape_explicit) return cursorShapeFromMouseShape(self.term.mouse_shape);
-    return if (self.term.flags.mouse_event != .none) .default else .text;
+    if (self.tab().mouse_shape_explicit) return cursorShapeFromMouseShape(self.tab().term.mouse_shape);
+    return if (self.tab().term.flags.mouse_event != .none) .default else .text;
 }
 
 fn linkModifiersActive(mods: vt.input.KeyMods, mouse_reporting: bool) bool {
@@ -2736,7 +3335,7 @@ fn linkModifiersActive(mods: vt.input.KeyMods, mouse_reporting: bool) bool {
 fn linksActive(self: *App) bool {
     return linkModifiersActive(
         self.keyboard.currentMods(),
-        self.term.flags.mouse_event != .none,
+        self.tab().term.flags.mouse_event != .none,
     );
 }
 
@@ -2865,40 +3464,54 @@ test "busy OSC 52 read replies empty without disturbing the active transfer" {
     const alloc = std.testing.allocator;
     const linux = std.os.linux;
     var incoming: [2]posix.fd_t = undefined;
-    var output: [2]posix.fd_t = undefined;
+    var output_a: [2]posix.fd_t = undefined;
+    var output_b: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&incoming, .{ .CLOEXEC = true, .NONBLOCK = true })));
     try std.testing.expectEqual(@as(usize, 5), linux.write(incoming[1], "hello", 5));
     _ = linux.close(incoming[1]);
-    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
-    defer _ = linux.close(output[0]);
-    defer _ = linux.close(output[1]);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output_a, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output_a[0]);
+    defer _ = linux.close(output_a[1]);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output_b, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output_b[0]);
+    defer _ = linux.close(output_b[1]);
+    const tab_a = pipeBackedTab(alloc, output_a[1]);
+    defer alloc.destroy(tab_a);
+    defer tab_a.kitty_clipboard.deinit();
+    defer tab_a.write_queue.deinit(alloc);
+    const tab_b = pipeBackedTab(alloc, output_b[1]);
+    defer alloc.destroy(tab_b);
+    defer tab_b.kitty_clipboard.deinit();
+    defer tab_b.write_queue.deinit(alloc);
+    tab_b.id = 2;
     const app = try alloc.create(App);
     defer alloc.destroy(app);
     app.alloc = alloc;
+    app.active = tab_a;
+    app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    try app.tabs.append(alloc, tab_a);
+    try app.tabs.append(alloc, tab_b);
     app.clipboard = .init(alloc, null, null);
     defer app.clipboard.deinit();
-    app.write_queue = .empty;
-    app.write_queue_offset = 0;
-    defer app.write_queue.deinit(alloc);
-    app.pty.master = output[1];
     app.clipboard.transfer_fd = incoming[0];
-    app.clipboard.transfer_action = .{ .osc52_read = 'c' };
+    app.clipboard.transfer_action = .{ .osc52_read = .{ .tab_id = tab_a.id, .kind = 'c' } };
 
-    app.beginOsc52Read('p');
+    app.beginOsc52Read(tab_b, 'p');
     var buf: [64]u8 = undefined;
-    const busy_len = try posix.read(output[0], &buf);
+    const busy_len = try posix.read(output_b[0], &buf);
     try std.testing.expectEqualStrings("\x1b]52;p;\x07", buf[0..busy_len]);
     try std.testing.expectEqual(incoming[0], app.clipboard.transferFd());
-    try std.testing.expectEqual(@as(?u8, 'c'), app.clipboard.osc52ReadKind());
+    try std.testing.expectEqual(@as(?u8, 'c'), app.clipboard.osc52Read().?.kind);
 
     const event = (try app.clipboard.readTransfer()).?;
     try std.testing.expectEqual(@as(u8, 'c'), event.osc52_read.kind);
     try std.testing.expectEqualStrings("hello", event.osc52_read.data);
-    app.writeOsc52ClipboardReport(event.osc52_read.kind, event.osc52_read.data);
+    app.writeOsc52ClipboardReport(tab_a, event.osc52_read.kind, event.osc52_read.data);
     app.clipboard.finishEvent();
-    const completed_len = try posix.read(output[0], &buf);
+    const completed_len = try posix.read(output_a[0], &buf);
     try std.testing.expectEqualStrings("\x1b]52;c;aGVsbG8=\x07", buf[0..completed_len]);
-    try std.testing.expectError(error.WouldBlock, posix.read(output[0], &buf));
+    try std.testing.expectError(error.WouldBlock, posix.read(output_b[0], &buf));
 }
 
 test "PNG decode rejects oversized dimensions before rasterization" {
@@ -2964,45 +3577,64 @@ test "portal appearance values map to application preferences" {
 /// Mode actions send the immediate report, including when an application
 /// re-enables an already-enabled mode. This end-of-chunk sync is a
 /// fallback for any state changes that do not pass through AppStreamHandler.
-fn syncInBandSizeReports(self: *App) void {
-    const enabled = self.term.modes.get(.in_band_size_reports);
-    if (enabled and !self.in_band_reports) self.sendSizeReport();
-    self.in_band_reports = enabled;
+fn syncInBandSizeReports(self: *App, tb: *Tab) void {
+    const enabled = tb.term.modes.get(.in_band_size_reports);
+    if (enabled and !tb.in_band_reports) self.sendSizeReport(tb);
+    tb.in_band_reports = enabled;
 }
 
-fn sendSizeReport(self: *App) void {
+fn sendSizeReport(self: *App, tb: *Tab) void {
     var buf: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
-    vt.size_report.encode(&writer, .mode_2048, self.currentSize()) catch return;
-    self.writePty(writer.buffered());
+    vt.size_report.encode(&writer, .mode_2048, self.currentSize(tb)) catch return;
+    tb.writePty(writer.buffered());
+}
+
+/// Propagate a resized grid to a child that enabled DEC 2048 in-band size
+/// reports. Such apps halt SIGWINCH handling and draw from the inline report
+/// alone, so a resize that reflows Monstar's grid without pushing a fresh
+/// report leaves the child at the old size until it restarts.
+fn notifyTabResize(self: *App, tb: *Tab) void {
+    if (tb.term.modes.get(.in_band_size_reports)) self.sendSizeReport(tb);
 }
 
 /// DEC mode 2026 (synchronized output): while enabled, the terminal
 /// state may change but frames should not expose the intermediate state.
 /// A one-shot timer prevents a misbehaving child from freezing output.
-fn syncSynchronizedOutput(self: *App) void {
-    const enabled = self.term.modes.get(.synchronized_output);
-    if (enabled == self.sync_output) return;
+fn syncSynchronizedOutput(self: *App, tb: *Tab) void {
+    const now_ns = self.nowNs();
+    if (!tb.syncSynchronizedOutput(now_ns, sync_output_reset_ms * std.time.ns_per_ms)) return;
+    self.armSyncOutputTimer(now_ns);
+    if (tb.sync_output_deadline_ns == null) self.needs_redraw = true;
+}
 
-    self.sync_output = enabled;
-    if (enabled) {
-        _ = setTimer(self.sync_output_fd, .{
-            .it_value = timespecFromNs(sync_output_reset_ms * std.time.ns_per_ms),
-            .it_interval = .{ .sec = 0, .nsec = 0 },
-        }, "synchronized output");
-    } else {
-        _ = setTimer(self.sync_output_fd, disarmed_timer, "synchronized output");
-        self.needs_redraw = true;
+fn armSyncOutputTimer(self: *App, now_ns: u64) void {
+    var next: ?u64 = null;
+    for (self.tabs.items) |tb| {
+        const deadline = tb.sync_output_deadline_ns orelse continue;
+        next = @min(next orelse deadline, deadline);
     }
+    _ = setTimer(self.sync_output_fd, if (next) |deadline| .{
+        // Zero disarms timerfd, so already-due batches need a positive delay.
+        .it_value = timespecFromNs(@max(1, deadline -| now_ns)),
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    } else disarmed_timer, "synchronized output");
 }
 
 fn fireSyncOutputReset(self: *App) void {
     _ = readTimer(self.sync_output_fd) orelse return;
-    if (self.term.modes.get(.synchronized_output)) {
+    const now_ns = self.nowNs();
+    var any_frozen = false;
+    for (self.tabs.items) |tb| {
+        if (!tb.expireSynchronizedOutput(now_ns)) continue;
         log.debug("synchronized output timed out; forcing redraw", .{});
-        self.term.modes.set(.synchronized_output, false);
+        any_frozen = true;
     }
-    self.syncSynchronizedOutput();
+    self.armSyncOutputTimer(now_ns);
+    if (any_frozen) {
+        self.needs_redraw = true;
+        self.requestFullAsyncRedraw();
+    }
 }
 
 fn armTaskbarProgressTimer(self: *App) void {
@@ -3010,6 +3642,46 @@ fn armTaskbarProgressTimer(self: *App) void {
         .it_value = .{ .sec = taskbar_progress_timeout_seconds, .nsec = 0 },
         .it_interval = .{ .sec = 0, .nsec = 0 },
     }, "taskbar progress");
+}
+
+test "synchronized output deadlines survive another tab ending its batch" {
+    const alloc = std.testing.allocator;
+    const a = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(a);
+    a.term = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer a.term.deinit(alloc);
+    const b = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(b);
+    b.term = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer b.term.deinit(alloc);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.io = std.testing.io;
+    app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    try app.tabs.appendSlice(alloc, &.{ a, b });
+    app.sync_output_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.sync_output_fd);
+
+    a.term.modes.set(.synchronized_output, true);
+    app.syncSynchronizedOutput(a);
+    const a_deadline = a.sync_output_deadline_ns.?;
+    b.term.modes.set(.synchronized_output, true);
+    app.syncSynchronizedOutput(b);
+    b.term.modes.set(.synchronized_output, false);
+    app.syncSynchronizedOutput(b);
+    try std.testing.expectEqual(a_deadline, a.sync_output_deadline_ns.?);
+    var remaining: std.os.linux.itimerspec = undefined;
+    try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.timerfd_gettime(app.sync_output_fd, &remaining)));
+    try std.testing.expect(remaining.it_value.sec != 0 or remaining.it_value.nsec != 0);
+
+    b.term.modes.set(.synchronized_output, true);
+    _ = b.syncSynchronizedOutput(a_deadline, std.time.ns_per_s);
+    try std.testing.expect(!a.expireSynchronizedOutput(a_deadline - 1));
+    try std.testing.expect(a.expireSynchronizedOutput(a_deadline));
+    try std.testing.expect(!a.term.modes.get(.synchronized_output));
+    try std.testing.expect(!b.expireSynchronizedOutput(a_deadline));
+    try std.testing.expect(b.term.modes.get(.synchronized_output));
 }
 
 fn stopTaskbarProgressTimer(self: *App) void {
@@ -3089,12 +3761,40 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             self.last_serial = button.serial;
             if (button.state == .pressed) self.stopFling();
             if (button.button == 272) { // BTN_LEFT
+                if (button.state == .pressed) self.tab_bar_press = false;
+                switch (button.state) {
+                    .pressed => if (self.pointerInTabBar()) {
+                        self.tab_bar_press = true;
+                        self.activateTabAtPointer();
+                        return;
+                    },
+                    .released => if (self.tab_bar_press) {
+                        self.tab_bar_press = false;
+                        return;
+                    },
+                    else => {},
+                }
                 if (button.state == .pressed and self.beginScrollbarDrag()) return;
                 if (button.state == .released and self.finishScrollbarDrag()) return;
             }
+            if (button.button == 274) { // BTN_MIDDLE
+                if (button.state == .pressed) self.tab_bar_middle_press = false;
+                switch (button.state) {
+                    .pressed => if (self.pointerInTabBar()) {
+                        self.tab_bar_middle_press = true;
+                        self.closeTabAtPointer();
+                        return;
+                    },
+                    .released => if (self.tab_bar_middle_press) {
+                        self.tab_bar_middle_press = false;
+                        return;
+                    },
+                    else => {},
+                }
+            }
             // Mouse reporting wins when the application asked for it,
             // except that shift bypasses it for terminal-side selection.
-            const reporting = self.term.flags.mouse_event != .none and
+            const reporting = self.tab().term.flags.mouse_event != .none and
                 !self.keyboard.currentMods().shift;
             const mouse_button = mouseButtonFromEvdev(button.button);
 
@@ -3174,14 +3874,92 @@ fn pointerSurfacePhysical(self: *const App) struct { x: f64, y: f64 } {
     };
 }
 
+const TabBarRect = struct {
+    top: u31,
+    height: u31,
+};
+
+fn tabBarRect(layout: TerminalLayout, configured_height: u31, position: Config.TabBarPosition) ?TabBarRect {
+    const reserved = switch (position) {
+        .top => layout.grid_y,
+        .bottom => layout.surface_height -| layout.grid_y -| layout.grid_height,
+    };
+    const height = @min(configured_height, reserved);
+    if (height == 0) return null;
+    return .{
+        .top = switch (position) {
+            .top => 0,
+            .bottom => layout.surface_height - height,
+        },
+        .height = height,
+    };
+}
+
+test "tab bar hit rectangle follows its configured edge and fitted padding" {
+    const layout: TerminalLayout = .{
+        .surface_width = 100,
+        .surface_height = 80,
+        .grid_x = 0,
+        .grid_y = 20,
+        .grid_width = 100,
+        .grid_height = 40,
+        .columns = 10,
+        .rows = 2,
+        .padding = .{ .top = 20, .bottom = 20 },
+    };
+
+    try std.testing.expectEqual(TabBarRect{ .top = 0, .height = 15 }, tabBarRect(layout, 15, .top).?);
+    try std.testing.expectEqual(TabBarRect{ .top = 65, .height = 15 }, tabBarRect(layout, 15, .bottom).?);
+    try std.testing.expectEqual(TabBarRect{ .top = 60, .height = 20 }, tabBarRect(layout, 30, .bottom).?);
+    try std.testing.expectEqual(@as(?TabBarRect, null), tabBarRect(layout, 0, .top));
+}
+
+fn pointerInTabBar(self: *const App) bool {
+    if (!self.pointer_inside) return false;
+    const rect = tabBarRect(self.layout, self.tab_bar_height, self.config.tab_bar_position) orelse return false;
+    const pos = self.pointerSurfacePhysical();
+    return pos.x < self.layout.surface_width and pos.y >= rect.top and pos.y < rect.top + rect.height;
+}
+
+fn activateTabAtPointer(self: *App) void {
+    if (self.tabIndexAtPointer()) |index| self.activateIndex(index);
+    self.syncCursorShape();
+}
+
+fn closeTabAtPointer(self: *App) void {
+    if (self.tabIndexAtPointer()) |index| self.closeTabAt(index);
+    self.syncCursorShape();
+}
+
+fn tabIndexAtPointer(self: *App) ?usize {
+    const pos = self.pointerSurfacePhysical();
+    const x: u31 = @intFromFloat(pos.x);
+    const items = self.tabBarSnapshot() catch |err| {
+        log.warn("cannot hit test tab bar: {}", .{err});
+        return null;
+    };
+    defer self.freeTabBarSnapshot(items);
+    const index = Renderer.tabBarItemAt(
+        self.alloc,
+        items,
+        self.layout.surface_width,
+        self.font.cell_width,
+        x,
+    ) catch |err| {
+        log.warn("cannot hit test tab bar: {}", .{err});
+        return null;
+    };
+    return index;
+}
+
 fn scrollbarPointerEligible(self: *App) bool {
-    if (!self.pointer_inside or self.term.screens.active_key != .primary or
+    if (!self.pointer_inside or self.tab().term.screens.active_key != .primary or
         self.scrollbar_drag != null or self.selecting or self.mouse_button != null or
         self.link_press != null)
     {
         return false;
     }
-    const scrollbar = self.term.screens.active.pages.scrollbar();
+    const scrollbar = self.tab().term.screens.active.pages.scrollbar();
     return scrollbar.total > scrollbar.len;
 }
 
@@ -3203,8 +3981,8 @@ fn syncScrollbarHover(self: *App) void {
     if (reveal_hovered) {
         self.revealScrollbar();
     } else {
-        const scrollbar = self.term.screens.active.pages.scrollbar();
-        if (self.term.screens.active_key != .primary or scrollbar.total <= scrollbar.len) {
+        const scrollbar = self.tab().term.screens.active.pages.scrollbar();
+        if (self.tab().term.screens.active_key != .primary or scrollbar.total <= scrollbar.len) {
             self.hideScrollbar();
         } else if (self.scrollbar_alpha > 0) {
             const changed = self.scrollbar_alpha != scrollbar_default_alpha;
@@ -3223,7 +4001,7 @@ fn syncScrollbarHoverFromPointer(self: *App) void {
 
 fn scrollbarThumbUnderPointer(self: *App) ?ScrollbarGeometry {
     if (!self.scrollbarPointerEligible()) return null;
-    const scrollbar = self.term.screens.active.pages.scrollbar();
+    const scrollbar = self.tab().term.screens.active.pages.scrollbar();
     const geometry = scrollbarGeometry(scrollbar, self.layout, self.window.scale120, scrollbar_default_alpha) orelse return null;
     const pos = self.pointerSurfacePhysical();
     const hit_width = @max(geometry.thumb.width, Window.physicalDimension(scrollbar_hit_width, self.window.scale120));
@@ -3236,7 +4014,7 @@ fn scrollbarThumbUnderPointer(self: *App) ?ScrollbarGeometry {
 
 fn scrollbarThumbHit(self: *App) ?ScrollbarGeometry {
     if (self.scrollbar_alpha == 0) return null;
-    const scrollbar = self.term.screens.active.pages.scrollbar();
+    const scrollbar = self.tab().term.screens.active.pages.scrollbar();
     if (!scrollbarShouldRender(scrollbar, self.scrollbar_alpha)) return null;
     return self.scrollbarThumbUnderPointer();
 }
@@ -3254,7 +4032,7 @@ fn beginScrollbarDrag(self: *App) bool {
             0,
             @as(f64, @floatFromInt(geometry.thumb.height)),
         ),
-        .screen = self.term.screens.active_key,
+        .screen = self.tab().term.screens.active_key,
     };
     self.revealScrollbar();
     self.syncHoveredLink(true);
@@ -3264,11 +4042,11 @@ fn beginScrollbarDrag(self: *App) bool {
 
 fn dragScrollbar(self: *App) void {
     const drag = self.scrollbar_drag orelse return;
-    if (drag.screen != self.term.screens.active_key) return;
+    if (drag.screen != self.tab().term.screens.active_key) return;
     const geometry = self.currentScrollbarGeometry(scrollbar_hover_alpha) orelse return;
     const pos = self.pointerSurfacePhysical();
     const row = scrollbarRowForThumbY(geometry, pos.y - drag.grab_offset);
-    self.term.screens.active.pages.scroll(.{ .row = row });
+    self.tab().term.screens.active.pages.scroll(.{ .row = row });
     self.revealScrollbar();
     self.needs_redraw = true;
     self.syncHoveredLink(true);
@@ -3291,18 +4069,18 @@ fn cellAtPointer(self: *App) struct { x: u16, y: u16 } {
     const py: f64 = @max(0, self.pointer_y * scale - @as(f64, @floatFromInt(self.layout.grid_y)));
     const x: u16 = @intFromFloat(@min(
         px / @as(f64, @floatFromInt(self.font.cell_width)),
-        @as(f64, @floatFromInt(self.term.cols -| 1)),
+        @as(f64, @floatFromInt(self.tab().term.cols -| 1)),
     ));
     const y: u16 = @intFromFloat(@min(
         py / @as(f64, @floatFromInt(self.font.cell_height)),
-        @as(f64, @floatFromInt(self.term.rows -| 1)),
+        @as(f64, @floatFromInt(self.tab().term.rows -| 1)),
     ));
     return .{ .x = x, .y = y };
 }
 
 fn pinAtPointer(self: *App) ?vt.Pin {
     const cell = self.cellAtPointer();
-    return self.term.screens.active.pages.pin(.{
+    return self.tab().term.screens.active.pages.pin(.{
         .viewport = .{ .x = cell.x, .y = cell.y },
     });
 }
@@ -3328,7 +4106,7 @@ fn linkCellAtPointer(self: *App) ?vt.Coordinate {
 
 fn linkPinAtPointer(self: *App) ?vt.Pin {
     const cell = self.linkCellAtPointer() orelse return null;
-    return self.term.screens.active.pages.pin(.{ .viewport = cell });
+    return self.tab().term.screens.active.pages.pin(.{ .viewport = cell });
 }
 
 fn oscHyperlinkAtPin(pin: vt.Pin) ?[]const u8 {
@@ -3346,7 +4124,7 @@ fn detectHoveredLink(self: *App) !?HoveredLink {
         return .{ .uri = try self.alloc.dupe(u8, uri), .range = null };
     }
 
-    const screen = self.term.screens.active;
+    const screen = self.tab().term.screens.active;
     const line = screen.selectLine(.{
         .pin = pin,
         .whitespace = null,
@@ -3379,13 +4157,13 @@ fn detectHoveredLink(self: *App) !?HoveredLink {
 }
 
 fn linkRange(self: *App, selection: vt.Selection) ?Renderer.LinkRange {
-    const screen = self.term.screens.active;
+    const screen = self.tab().term.screens.active;
     return highlightRange(
         screen,
         selection.topLeft(screen),
         selection.bottomRight(screen),
-        self.term.rows,
-        self.term.cols,
+        self.tab().term.rows,
+        self.tab().term.cols,
     );
 }
 
@@ -3563,7 +4341,7 @@ fn pointerPhysical(self: *App) struct { x: f64, y: f64 } {
 
 fn selectionGeometry(self: *App) vt.SelectionGesture.Drag.Geometry {
     return .{
-        .columns = self.term.cols,
+        .columns = self.tab().term.cols,
         .cell_width = self.font.cell_width,
         .padding_left = self.layout.grid_x,
         .screen_height = self.layout.grid_height,
@@ -3577,6 +4355,16 @@ fn physicalPadding(config: Config, scale120: u32) TerminalLayout.Padding {
         .top = Window.physicalDimension(config.window_padding_y.first, scale120),
         .bottom = Window.physicalDimension(config.window_padding_y.second, scale120),
     };
+}
+
+/// Window padding with the tab-bar strip reserved on the configured edge.
+fn paddingWithTabBar(config: Config, scale120: u32, tab_bar_height: u31) TerminalLayout.Padding {
+    var padding = physicalPadding(config, scale120);
+    switch (config.tab_bar_position) {
+        .top => padding.top +|= tab_bar_height,
+        .bottom => padding.bottom +|= tab_bar_height,
+    }
+    return padding;
 }
 
 fn selectionTimestamp(ms: u32) std.Io.Timestamp {
@@ -3595,7 +4383,7 @@ fn mouseButtonFromEvdev(button: u32) ?vt.input.MouseButton {
 }
 
 fn reportingMouse(self: *App) bool {
-    return self.term.flags.mouse_event != .none and !self.keyboard.currentMods().shift;
+    return self.tab().term.flags.mouse_event != .none and !self.keyboard.currentMods().shift;
 }
 
 fn forwardMouseButton(self: *App, button: anytype, mouse_button: vt.input.MouseButton) void {
@@ -3617,7 +4405,7 @@ fn startSelection(self: *App, time_ms: u32) void {
     const pin = self.pinAtPointer() orelse return;
     const pos = self.pointerPhysical();
     self.selection_rectangle = self.keyboard.currentMods().ctrl;
-    const selection = self.selection_gesture.press(&self.term, .{
+    const selection = self.selection_gesture.press(&self.tab().term, .{
         .time = selectionTimestamp(time_ms),
         .pin = pin,
         .xpos = pos.x,
@@ -3633,7 +4421,7 @@ fn startSelection(self: *App, time_ms: u32) void {
 fn extendSelection(self: *App) void {
     const pin = self.pinAtPointer() orelse return;
     const pos = self.pointerPhysical();
-    const selection = self.selection_gesture.drag(&self.term, .{
+    const selection = self.selection_gesture.drag(&self.tab().term, .{
         .pin = pin,
         .xpos = pos.x,
         .ypos = pos.y,
@@ -3650,14 +4438,14 @@ fn extendSelection(self: *App) void {
 fn cancelDrag(self: *App) void {
     self.selecting = false;
     self.selection_rectangle = false;
-    self.selection_gesture.reset(&self.term);
+    self.selection_gesture.reset(&self.tab().term);
     self.stopSelectionAutoscrollTimer();
 }
 
 fn finishSelection(self: *App) void {
     if (!self.selecting) return;
     self.selecting = false;
-    self.selection_gesture.release(&self.term, .{ .pin = self.pinAtPointer() });
+    self.selection_gesture.release(&self.tab().term, .{ .pin = self.pinAtPointer() });
     self.selection_rectangle = false;
     self.stopSelectionAutoscrollTimer();
     // Finished selections claim the primary selection, X style.
@@ -3665,7 +4453,7 @@ fn finishSelection(self: *App) void {
 }
 
 fn applySelection(self: *App, selection: ?vt.Selection, clear_if_null: bool) void {
-    const screen = self.term.screens.active;
+    const screen = self.tab().term.screens.active;
     if (selection) |sel| {
         screen.select(sel) catch return;
         self.needs_redraw = true;
@@ -3697,7 +4485,7 @@ fn fireSelectionAutoscroll(self: *App) void {
 
     const cell = self.cellAtPointer();
     const pos = self.pointerPhysical();
-    const selection = self.selection_gesture.autoscrollTick(&self.term, .{
+    const selection = self.selection_gesture.autoscrollTick(&self.tab().term, .{
         .viewport = .{ .x = cell.x, .y = cell.y },
         .xpos = pos.x,
         .ypos = pos.y,
@@ -3714,7 +4502,7 @@ fn fireSelectionAutoscroll(self: *App) void {
 /// Drop the current selection and stop any in-progress drag.
 fn clearSelection(self: *App) void {
     self.cancelDrag();
-    const screen = self.term.screens.active;
+    const screen = self.tab().term.screens.active;
     if (screen.selection != null) {
         screen.clearSelection();
         self.needs_redraw = true;
@@ -3724,10 +4512,11 @@ fn clearSelection(self: *App) void {
 /// React to alt screen enter/exit: an in-flight drag must not span
 /// screens (its anchor pin belongs to the old screen's pages). The
 /// terminal itself clears the incoming screen's selection.
-fn syncActiveScreen(self: *App) void {
-    const key = self.term.screens.active_key;
-    if (key == self.active_screen) return;
-    self.active_screen = key;
+fn syncActiveScreen(self: *App, tb: *Tab) void {
+    const key = tb.term.screens.active_key;
+    if (key == tb.active_screen) return;
+    tb.active_screen = key;
+    if (tb != self.active) return;
     self.scrollbar_reveal_hovered = false;
     self.scrollbar_hovered = false;
     self.hideScrollbar();
@@ -3746,7 +4535,7 @@ fn clipboardDevicesChanged(
 
 /// The current selection's text, allocated, or null if nothing selected.
 fn selectionText(self: *App) ?[:0]const u8 {
-    const screen = self.term.screens.active;
+    const screen = self.tab().term.screens.active;
     const sel = screen.selection orelse return null;
     return screen.selectionString(self.alloc, .{ .sel = sel, .trim = true }) catch null;
 }
@@ -3786,15 +4575,16 @@ fn fireCopyHighlightTimeout(self: *App) void {
 /// Ask the offer's owner to stream its contents into a pipe; the read
 /// end joins the poll loop and the paste completes on EOF.
 fn beginPaste(self: *App, target: Clipboard.Target) void {
-    _ = self.clipboard.request(target, .{ .terminal = target });
+    _ = self.clipboard.request(target, .{ .terminal = .{ .tab_id = self.tab().id, .target = target } });
 }
 
 fn expireClipboardTransfers(self: *App) void {
-    const osc52_kind = self.clipboard.osc52ReadKind();
+    const osc52_read = self.clipboard.osc52Read();
+    const kitty_read_tab_id = self.clipboard.kittyReadTabId();
     if (!self.clipboard.expireTransfers()) return;
-    if (osc52_kind) |kind| self.writeOsc52ClipboardReport(kind, "");
-    self.failStartedKittyRead(.EIO);
-    self.pumpKittyClipboard();
+    if (osc52_read) |read| if (self.findTab(read.tab_id)) |tb| self.writeOsc52ClipboardReport(tb, read.kind, "");
+    self.failStartedKittyRead(kitty_read_tab_id, .EIO);
+    self.pumpKittyClipboards();
 }
 
 test "expired Kitty read fails and unblocks the next queued request" {
@@ -3807,27 +4597,30 @@ test "expired Kitty read fails and unblocks the next queued request" {
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
     defer _ = linux.close(output[0]);
     defer _ = linux.close(output[1]);
+    const tb = pipeBackedTab(alloc, output[1]);
+    defer alloc.destroy(tb);
+    defer tb.kitty_clipboard.deinit();
+    defer tb.write_queue.deinit(alloc);
     const app = try alloc.create(App);
     defer alloc.destroy(app);
     app.alloc = alloc;
+    app.active = tb;
+    app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    try app.tabs.append(alloc, tb);
     app.clipboard = .init(alloc, null, null);
     defer app.clipboard.deinit();
-    app.kitty_clipboard = .init(alloc);
-    defer app.kitty_clipboard.deinit();
-    app.write_queue = .empty;
-    app.write_queue_offset = 0;
-    defer app.write_queue.deinit(alloc);
-    app.pty.master = output[1];
     app.clipboard.transfer_fd = incoming[0];
     app.clipboard.transfer_deadline_ms = 0;
-    try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=first", .payload = "dGV4dC9wbGFpbg==", .terminator = .st });
-    app.kitty_clipboard.front().?.read.started = true;
-    try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=second", .payload = "Lg==", .terminator = .st });
+    app.clipboard.transfer_action = .{ .kitty_read = .{ .tab_id = tb.id, .mime = "text/plain" } };
+    try tb.kitty_clipboard.handle(.{ .metadata = "type=read:id=first", .payload = "dGV4dC9wbGFpbg==", .terminator = .st });
+    tb.kitty_clipboard.front().?.read.started = true;
+    try tb.kitty_clipboard.handle(.{ .metadata = "type=read:id=second", .payload = "Lg==", .terminator = .st });
 
     app.expireClipboardTransfers();
     try std.testing.expectEqual(@as(posix.fd_t, -1), app.clipboard.transferFd());
-    try std.testing.expect(app.kitty_clipboard.front() == null);
-    try std.testing.expectEqual(@as(usize, 0), app.kitty_clipboard.retained_bytes);
+    try std.testing.expect(tb.kitty_clipboard.front() == null);
+    try std.testing.expectEqual(@as(usize, 0), tb.kitty_clipboard.retained_bytes);
     var buf: [1024]u8 = undefined;
     const n = try posix.read(output[0], &buf);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "status=EIO") != null);
@@ -3836,45 +4629,107 @@ test "expired Kitty read fails and unblocks the next queued request" {
     try std.testing.expect(first < second);
 }
 
+test "clipboard paste stays with its requesting tab or is discarded after close" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.io = std.testing.io;
+    app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    app.clipboard = .init(alloc, null, null);
+    defer app.clipboard.deinit();
+    const a = pipeBackedTab(alloc, -1);
+    const b = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(a);
+    defer alloc.destroy(b);
+    const tabs = [_]*Tab{ a, b };
+    for (tabs, 0..) |tb, i| {
+        tb.id = i + 1;
+        tb.app = app;
+        tb.term = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+        tb.stream = .init(.{ .allocator = alloc, .handler = .{
+            .app = app,
+            .tab = tb,
+            .terminal_handler = .init(&tb.term),
+        } });
+        app.installEffects(tb);
+    }
+    defer for (tabs) |tb| {
+        tb.stream.deinit();
+        tb.term.deinit(alloc);
+        tb.write_queue.deinit(alloc);
+        tb.kitty_clipboard.deinit();
+    };
+    a.term.modes.set(.bracketed_paste, true);
+    app.active = b;
+    for ([_]Clipboard.Target{ .clipboard, .primary }) |target| {
+        for ([_]bool{ false, true }) |closed| {
+            app.tabs.clearRetainingCapacity();
+            if (!closed) try app.tabs.append(alloc, a);
+            try app.tabs.append(alloc, b);
+            for (tabs) |tb| {
+                tb.write_queue.clearRetainingCapacity();
+                // Keep writes queued, so the test does not need a live PTY.
+                try tb.write_queue.append(alloc, 0);
+            }
+            var incoming: [2]posix.fd_t = undefined;
+            try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&incoming, .{ .CLOEXEC = true, .NONBLOCK = true })));
+            app.clipboard.transfer_fd = incoming[0];
+            app.clipboard.transfer_action = .{ .terminal = .{ .tab_id = a.id, .target = target, .mime = "text/plain" } };
+            try std.testing.expectEqual(@as(usize, 7), linux.write(incoming[1], "payload", 7));
+            _ = linux.close(incoming[1]);
+            app.readClipboardTransfer();
+            try std.testing.expectEqualStrings(if (closed) "\x00" else "\x00\x1b[200~payload\x1b[201~", a.write_queue.items);
+            try std.testing.expectEqualStrings("\x00", b.write_queue.items);
+        }
+    }
+}
+
 fn readClipboardTransfer(self: *App) void {
-    const osc52_kind = self.clipboard.osc52ReadKind();
+    const osc52_read = self.clipboard.osc52Read();
+    const kitty_read_tab_id = self.clipboard.kittyReadTabId();
     const event = self.clipboard.readTransfer() catch |err| {
         log.warn("clipboard transfer failed: {}", .{err});
-        if (osc52_kind) |kind| self.writeOsc52ClipboardReport(kind, "");
-        self.failStartedKittyRead(.EIO);
-        self.pumpKittyClipboard();
+        if (osc52_read) |read| if (self.findTab(read.tab_id)) |tb| self.writeOsc52ClipboardReport(tb, read.kind, "");
+        self.failStartedKittyRead(kitty_read_tab_id, .EIO);
+        self.pumpKittyClipboards();
         return;
     } orelse return;
-    defer self.pumpKittyClipboard();
+    defer self.pumpKittyClipboards();
     defer self.clipboard.finishEvent();
     switch (event) {
-        .terminal => |paste| self.writeTerminalPaste(
+        .terminal => |paste| if (self.findTab(paste.tab_id)) |tb| self.writeTerminalPaste(
+            tb,
             .{ .clipboard = clipboardLocation(paste.target) },
             paste.mime,
             paste.data,
         ),
-        .osc52_read => |read| self.writeOsc52ClipboardReport(read.kind, read.data),
+        .osc52_read => |read| if (self.findTab(read.tab_id)) |tb| self.writeOsc52ClipboardReport(tb, read.kind, read.data),
         .kitty_read => |read| {
-            const request = switch (self.kitty_clipboard.front().?.*) {
+            const tb = self.findTab(read.tab_id) orelse return;
+            const request = switch (tb.kitty_clipboard.front().?.*) {
                 .read => |*request| request,
                 else => unreachable,
             };
             std.debug.assert(request.started);
             var available_buf: [clipboard_format.paste_mime_preference.len][]const u8 = undefined;
             self.finishKittyClipboardRead(
+                tb,
                 request,
                 self.clipboard.availableMimes(clipboardTargetFromKitty(request.target), &available_buf),
                 .{ .mime = read.mime, .data = read.data },
             );
         },
         .dnd => |drop| {
-            if (self.term.kitty_dnd) |state| {
+            if (self.tab().term.kitty_dnd) |state| {
                 self.writeKittyDndDrop(state, drop);
                 return;
             }
             const text = self.formatDropPaste(drop.mime, drop.data) catch return;
             defer self.alloc.free(text);
-            self.writeTerminalPaste(.text, "text/plain", text);
+            self.writeTerminalPaste(self.tab(), .text, "text/plain", text);
         },
     }
 }
@@ -3882,70 +4737,74 @@ fn readClipboardTransfer(self: *App) void {
 /// Start and retire committed OSC 5522 operations strictly from the FIFO
 /// head. Asynchronous reads stop the pump until their Wayland pipe reaches
 /// EOF; writes and metadata-only replies complete immediately in order.
-fn pumpKittyClipboard(self: *App) void {
-    while (self.kitty_clipboard.front()) |request| switch (request.*) {
-        .status => |*status| {
-            self.writeKittyClipboardStatus(status.op, status.id, status.terminator, status.status);
-            self.kitty_clipboard.pop();
-        },
-        .write => |*write| {
-            self.kitty_clipboard.prepareWrite(write);
-            const target = clipboardTarget(write.committed.loc) orelse {
-                self.writeKittyClipboardStatus(.write, write.committed.id, write.terminator, .ENOSYS);
-                self.kitty_clipboard.pop();
-                continue;
-            };
-            const status: vt.kitty.clipboard.Status = if (write.committed.contents.len == 0)
-                if (self.clipboard.clear(target, self.last_serial)) .DONE else .ENOSYS
-            else status: {
-                const text = for (write.committed.contents) |content| {
-                    if (vt.clipboard.isTextMime(content.mime)) break content.data;
-                } else break :status .ENOSYS;
-                const owned = self.alloc.dupeZ(u8, text) catch break :status .EIO;
-                break :status if (self.clipboard.claim(target, owned, self.last_serial)) .DONE else .ENOSYS;
-            };
-            self.writeKittyClipboardStatus(.write, write.committed.id, write.terminator, status);
-            self.kitty_clipboard.pop();
-        },
-        .read => |*read| {
-            if (read.started) return;
-            self.kitty_clipboard.prepareRead(read) catch {
-                self.writeKittyClipboardStatus(.read, read.id, read.terminator, .EIO);
-                self.kitty_clipboard.pop();
-                continue;
-            };
-            if (read.paste) |paste| {
-                const available = [_][]const u8{paste.mime};
-                self.finishKittyClipboardRead(read, &available, paste);
-                continue;
-            }
-            if (!read.needsTransfer()) {
-                var available_buf: [clipboard_format.paste_mime_preference.len][]const u8 = undefined;
-                self.finishKittyClipboardRead(
-                    read,
-                    self.clipboard.availableMimes(clipboardTargetFromKitty(read.target), &available_buf),
-                    null,
-                );
-                continue;
-            }
-
-            switch (self.clipboard.request(clipboardTargetFromKitty(read.target), .kitty_read)) {
-                .started => {
-                    read.started = true;
-                    return;
-                },
-                .busy => return,
-                .unavailable => {
-                    self.finishKittyClipboardRead(read, &.{}, null);
+fn pumpKittyClipboard(self: *App, tb: *Tab) void {
+    while (tb.kitty_clipboard.front()) |request| {
+        switch (request.*) {
+            .status => |*status| {
+                self.writeKittyClipboardStatus(tb, status.op, status.id, status.terminator, status.status);
+                tb.kitty_clipboard.pop();
+            },
+            .write => |*write| {
+                tb.kitty_clipboard.prepareWrite(write);
+                const target = clipboardTarget(write.committed.loc) orelse {
+                    self.writeKittyClipboardStatus(tb, .write, write.committed.id, write.terminator, .ENOSYS);
+                    tb.kitty_clipboard.pop();
                     continue;
-                },
-            }
-        },
-    };
+                };
+                const status: vt.kitty.clipboard.Status = if (write.committed.contents.len == 0)
+                    if (self.clipboard.clear(target, self.last_serial)) .DONE else .ENOSYS
+                else status: {
+                    const text = for (write.committed.contents) |content| {
+                        if (vt.clipboard.isTextMime(content.mime)) break content.data;
+                    } else break :status .ENOSYS;
+                    const owned = self.alloc.dupeZ(u8, text) catch break :status .EIO;
+                    break :status if (self.clipboard.claim(target, owned, self.last_serial)) .DONE else .ENOSYS;
+                };
+                self.writeKittyClipboardStatus(tb, .write, write.committed.id, write.terminator, status);
+                tb.kitty_clipboard.pop();
+            },
+            .read => |*read| {
+                if (read.started) return;
+                tb.kitty_clipboard.prepareRead(read) catch {
+                    self.writeKittyClipboardStatus(tb, .read, read.id, read.terminator, .EIO);
+                    tb.kitty_clipboard.pop();
+                    continue;
+                };
+                if (read.paste) |paste| {
+                    const available = [_][]const u8{paste.mime};
+                    self.finishKittyClipboardRead(tb, read, &available, paste);
+                    continue;
+                }
+                if (!read.needsTransfer()) {
+                    var available_buf: [clipboard_format.paste_mime_preference.len][]const u8 = undefined;
+                    self.finishKittyClipboardRead(
+                        tb,
+                        read,
+                        self.clipboard.availableMimes(clipboardTargetFromKitty(read.target), &available_buf),
+                        null,
+                    );
+                    continue;
+                }
+
+                switch (self.clipboard.request(clipboardTargetFromKitty(read.target), .{ .kitty_read = tb.id })) {
+                    .started => {
+                        read.started = true;
+                        return;
+                    },
+                    .busy => return,
+                    .unavailable => {
+                        self.finishKittyClipboardRead(tb, read, &.{}, null);
+                        continue;
+                    },
+                }
+            },
+        }
+    }
 }
 
 fn finishKittyClipboardRead(
     self: *App,
+    owner: *Tab,
     read: *const KittyClipboard.Read,
     available: []const []const u8,
     content: ?vt.clipboard.Content,
@@ -3953,27 +4812,35 @@ fn finishKittyClipboardRead(
     var writer: std.Io.Writer.Allocating = .init(self.alloc);
     defer writer.deinit();
     read.encodeSuccess(&writer.writer, available, content) catch {
-        self.writeKittyClipboardStatus(.read, read.id, read.terminator, .EIO);
-        self.kitty_clipboard.pop();
+        self.writeKittyClipboardStatus(owner, .read, read.id, read.terminator, .EIO);
+        owner.kitty_clipboard.pop();
         return;
     };
-    self.writePty(writer.writer.buffered());
-    self.kitty_clipboard.pop();
+    owner.writePty(writer.writer.buffered());
+    owner.kitty_clipboard.pop();
 }
 
-fn failStartedKittyRead(self: *App, status: vt.kitty.clipboard.Status) void {
-    const request = self.kitty_clipboard.front() orelse return;
+fn failStartedKittyRead(self: *App, tab_id: ?u64, status: vt.kitty.clipboard.Status) void {
+    // The active transfer records its originating tab ID in Clipboard.
+    // A closed requester is intentionally not resurrected or redirected.
+    const owner = self.findTab(tab_id orelse return) orelse return;
+    const request = owner.kitty_clipboard.front() orelse return;
     const read = switch (request.*) {
         .read => |*read| read,
         else => return,
     };
     if (!read.started) return;
-    self.writeKittyClipboardStatus(.read, read.id, read.terminator, status);
-    self.kitty_clipboard.pop();
+    self.writeKittyClipboardStatus(owner, .read, read.id, read.terminator, status);
+    owner.kitty_clipboard.pop();
+}
+
+fn pumpKittyClipboards(self: *App) void {
+    for (self.tabs.items) |tb| self.pumpKittyClipboard(tb);
 }
 
 fn writeKittyClipboardStatus(
     self: *App,
+    tb: *Tab,
     op: vt.kitty.clipboard.Operation,
     id: []const u8,
     terminator: vt.osc.Terminator,
@@ -3987,11 +4854,12 @@ fn writeKittyClipboardStatus(
         .id = id,
         .terminator = terminator,
     }).encode(&writer.writer) catch return;
-    self.writePty(writer.writer.buffered());
+    tb.writePty(writer.writer.buffered());
 }
 
 fn writeTerminalPaste(
     self: *App,
+    tb: *Tab,
     source: vt.PasteSource,
     mime: []const u8,
     data: []const u8,
@@ -3999,11 +4867,11 @@ fn writeTerminalPaste(
     if (data.len == 0) return;
 
     switch (source) {
-        .clipboard => |location| if (self.term.modes.get(.kitty_paste_events)) {
+        .clipboard => |location| if (tb.term.modes.get(.kitty_paste_events)) {
             const target = clipboardTarget(location) orelse return;
             var writer: std.Io.Writer.Allocating = .init(self.alloc);
             defer writer.deinit();
-            self.kitty_clipboard.paste(
+            tb.kitty_clipboard.paste(
                 self.io,
                 kittyClipboardTarget(target),
                 mime,
@@ -4013,7 +4881,7 @@ fn writeTerminalPaste(
                 log.warn("Kitty clipboard paste event failed: {}", .{err});
                 return;
             };
-            self.writePty(writer.writer.buffered());
+            tb.writePty(writer.writer.buffered());
             return;
         },
         .text => {},
@@ -4030,7 +4898,7 @@ fn writeTerminalPaste(
         .mime = if (decoded != null) "text/plain;charset=utf-8" else mime,
         .data = decoded orelse data,
     }};
-    _ = self.stream.handler.terminal_handler.paste(.{
+    _ = tb.stream.handler.terminal_handler.paste(.{
         .source = source,
         .contents = .{ .memory = &contents },
         // Preserve Monstar's existing paste policy. libghostty still applies
@@ -4052,19 +4920,29 @@ test "ordinary STRING pastes and text drops decode Latin-1" {
     const app = try alloc.create(App);
     defer alloc.destroy(app);
     app.alloc = alloc;
-    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
-    defer app.term.deinit(alloc);
-    app.stream = .init(.{
+    app.io = std.testing.io;
+    app.clipboard = .init(alloc, null, null);
+    defer app.clipboard.deinit();
+    const tb = pipeBackedTab(alloc, output[1]);
+    defer alloc.destroy(tb);
+    defer tb.kitty_clipboard.deinit();
+    tb.app = app;
+    tb.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer tb.term.deinit(alloc);
+    tb.stream = .init(.{
         .allocator = alloc,
-        .handler = .{ .app = app, .terminal_handler = .init(&app.term) },
+        .handler = .{ .app = app, .tab = tb, .terminal_handler = .init(&tb.term) },
     });
-    defer app.stream.deinit();
-    app.stream.handler.terminal_handler.effects = .readonly;
-    app.stream.handler.terminal_handler.effects.write_pty = effectWritePty;
-    app.write_queue = .empty;
-    app.write_queue_offset = 0;
-    defer app.write_queue.deinit(alloc);
-    app.pty.master = output[1];
+    defer tb.stream.deinit();
+    tb.stream.handler.terminal_handler.effects = .readonly;
+    tb.stream.handler.terminal_handler.effects.write_pty = effectWritePty;
+    tb.write_queue = .empty;
+    tb.write_queue_offset = 0;
+    defer tb.write_queue.deinit(alloc);
+    app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    try app.tabs.append(alloc, tb);
+    app.active = tb;
 
     // C3 A9 is valid UTF-8 too, but STRING still means two Latin-1 characters.
     const latin1 = "caf\xe9 \xa3\xff \xc3\xa9\n";
@@ -4074,14 +4952,14 @@ test "ordinary STRING pastes and text drops decode Latin-1" {
         .{ .mime = "UTF8_STRING", .data = utf8 },
     };
     for (cases) |case| {
-        app.term.modes.set(.bracketed_paste, false);
-        app.writeTerminalPaste(.{ .clipboard = .standard }, case.mime, case.data);
+        tb.term.modes.set(.bracketed_paste, false);
+        app.writeTerminalPaste(tb, .{ .clipboard = .standard }, case.mime, case.data);
         var buf: [128]u8 = undefined;
         const n = try posix.read(output[0], &buf);
         try std.testing.expectEqualStrings("café £ÿ Ã©\r", buf[0..n]);
 
-        app.term.modes.set(.bracketed_paste, true);
-        app.writeTerminalPaste(.{ .clipboard = .selection }, case.mime, case.data);
+        tb.term.modes.set(.bracketed_paste, true);
+        app.writeTerminalPaste(tb, .{ .clipboard = .selection }, case.mime, case.data);
         const bracketed_n = try posix.read(output[0], &buf);
         try std.testing.expectEqualStrings("\x1b[200~café £ÿ Ã©\n\x1b[201~", buf[0..bracketed_n]);
 
@@ -4114,7 +4992,7 @@ fn clipboardLocation(target: Clipboard.Target) vt.clipboard.Location {
 
 fn dndEvent(ctx: *anyopaque, event: Clipboard.DndEvent) bool {
     const self: *App = @ptrCast(@alignCast(ctx));
-    const state = self.term.kitty_dnd orelse return false;
+    const state = self.tab().term.kitty_dnd orelse return false;
 
     var writer: std.Io.Writer.Allocating = .init(self.alloc);
     defer writer.deinit();
@@ -4130,7 +5008,7 @@ fn dndEvent(ctx: *anyopaque, event: Clipboard.DndEvent) bool {
         },
         .leave => state.dragLeave(self.alloc, &writer.writer) catch return true,
     }
-    self.writePty(writer.writer.buffered());
+    self.tab().writePty(writer.writer.buffered());
     return true;
 }
 
@@ -4151,7 +5029,7 @@ fn writeKittyDndDrop(
         log.warn("Kitty drag-and-drop failed: {}", .{err});
         return;
     };
-    self.writePty(writer.writer.buffered());
+    self.tab().writePty(writer.writer.buffered());
 }
 
 fn kittyDndMove(
@@ -4165,11 +5043,11 @@ fn kittyDndMove(
     const pixel_y = @max(0, logical_y * scale - @as(f64, @floatFromInt(self.layout.grid_y)));
     const cell_x: u32 = @intFromFloat(@min(
         pixel_x / @as(f64, @floatFromInt(self.font.cell_width)),
-        @as(f64, @floatFromInt(self.term.cols -| 1)),
+        @as(f64, @floatFromInt(self.tab().term.cols -| 1)),
     ));
     const cell_y: u32 = @intFromFloat(@min(
         pixel_y / @as(f64, @floatFromInt(self.font.cell_height)),
-        @as(f64, @floatFromInt(self.term.rows -| 1)),
+        @as(f64, @floatFromInt(self.tab().term.rows -| 1)),
     ));
     return .{
         .cell_x = cell_x,
@@ -4187,8 +5065,8 @@ fn formatDropPaste(self: *App, mime: []const u8, data: []const u8) ![]u8 {
 }
 
 fn scrollTarget(self: *const App) ScrollTarget {
-    if (self.term.flags.mouse_event != .none) return .application;
-    return if (self.term.screens.active_key == .alternate) .keys else .viewport;
+    if (self.tab().term.flags.mouse_event != .none) return .application;
+    return if (self.tab().term.screens.active_key == .alternate) .keys else .viewport;
 }
 
 fn syncScrollTarget(self: *App) void {
@@ -4330,15 +5208,25 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     defer alloc.destroy(app);
     app.alloc = alloc;
     app.config = .{};
-    app.term = try .init(std.testing.io, alloc, .{ .cols = 16, .rows = 3, .max_scrollback_bytes = 100_000 });
-    defer app.term.deinit(alloc);
-    var stream = app.term.vtStream();
+    const tb = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(tb);
+    defer tb.kitty_clipboard.deinit();
+    app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    try app.tabs.append(alloc, tb);
+    app.active = tb;
+    tb.app = app;
+    tb.term = try .init(std.testing.io, alloc, .{ .cols = 16, .rows = 3, .max_scrollback_bytes = 100_000 });
+    defer tb.term.deinit(alloc);
+    tb.stream = .init(.{ .allocator = alloc, .handler = .{ .app = app, .tab = tb, .terminal_handler = .init(&tb.term) } });
+    defer tb.stream.deinit();
+    var stream = tb.term.vtStream();
     defer stream.deinit();
-    app.write_queue = .empty;
-    defer app.write_queue.deinit(alloc);
+    tb.write_queue = .empty;
+    defer tb.write_queue.deinit(alloc);
     // A backlog keeps actual encoded PTY input in the queue without a child.
-    try app.write_queue.append(alloc, 0);
-    app.write_queue_offset = 0;
+    try tb.write_queue.append(alloc, 0);
+    tb.write_queue_offset = 0;
     app.keyboard.state = null;
     app.window = try alloc.create(Window);
     defer alloc.destroy(app.window);
@@ -4353,7 +5241,7 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     app.pointer_y = 5;
     app.pointer_inside = false;
     app.mouse_button = null;
-    app.mouse_shape_explicit = false;
+    tb.mouse_shape_explicit = false;
     app.selection_gesture = .init;
     app.selection_autoscroll_fd = try createTimerFd();
     defer _ = std.os.linux.close(app.selection_autoscroll_fd);
@@ -4384,7 +5272,7 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
                 app.config.mouse_scroll_multiplier = .{ .discrete = multiplier, .precision = multiplier };
                 for ([_]i32{ -1, 1 }) |sign| {
                     for (0..3) |form| {
-                        app.write_queue.shrinkRetainingCapacity(1);
+                        tb.write_queue.shrinkRetainingCapacity(1);
                         switch (form) {
                             0 => pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = sign } }),
                             1 => pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = sign * 120 } }),
@@ -4393,7 +5281,7 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
                         pointerEvent(app, .frame);
                         // X10 suppresses wheel buttons; the other modes emit one report.
                         const expected = if (mode_index == 0) "" else if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M";
-                        try std.testing.expectEqualStrings(expected, app.write_queue.items[1..]);
+                        try std.testing.expectEqualStrings(expected, tb.write_queue.items[1..]);
                     }
                 }
             }
@@ -4402,52 +5290,52 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
 
     // Partial detents and precision pixels truncate toward zero, including reversals.
     for ([_]i32{ -1, 1 }) |sign| {
-        app.write_queue.shrinkRetainingCapacity(1);
+        tb.write_queue.shrinkRetainingCapacity(1);
         for ([_]i32{ 60, -30, 90 }, 0..) |amount, index| {
             pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = sign * amount } });
             pointerEvent(app, .frame);
-            if (index < 2) try std.testing.expectEqual(@as(usize, 1), app.write_queue.items.len);
+            if (index < 2) try std.testing.expectEqual(@as(usize, 1), tb.write_queue.items.len);
         }
-        try std.testing.expectEqualStrings(if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M", app.write_queue.items[1..]);
-        app.write_queue.shrinkRetainingCapacity(1);
+        try std.testing.expectEqualStrings(if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M", tb.write_queue.items[1..]);
+        tb.write_queue.shrinkRetainingCapacity(1);
         for ([_]f64{ 7, -2, 15 }, 0..) |amount, index| {
             pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(@as(f64, @floatFromInt(sign)) * amount) } });
             pointerEvent(app, .frame);
-            if (index < 2) try std.testing.expectEqual(@as(usize, 1), app.write_queue.items.len);
+            if (index < 2) try std.testing.expectEqual(@as(usize, 1), tb.write_queue.items.len);
         }
-        try std.testing.expectEqualStrings(if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M", app.write_queue.items[1..]);
+        try std.testing.expectEqualStrings(if (sign < 0) "\x1b[<64;1;1M" else "\x1b[<65;1;1M", tb.write_queue.items[1..]);
     }
 
     // value120 takes precedence over the legacy forms in the same frame.
-    app.write_queue.shrinkRetainingCapacity(1);
+    tb.write_queue.shrinkRetainingCapacity(1);
     pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(80) } });
     pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 2 } });
     pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = -120 } });
     pointerEvent(app, .frame);
-    try std.testing.expectEqualStrings("\x1b[<64;1;1M", app.write_queue.items[1..]);
+    try std.testing.expectEqualStrings("\x1b[<64;1;1M", tb.write_queue.items[1..]);
     try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
 
     // Local scrolling moves history instead of writing PTY input.
     stream.nextSlice("\x1b[?1049l\x1b[?1003l");
     for (0..30) |_| stream.nextSlice("line\r\n");
     app.config.mouse_scroll_multiplier = .{ .discrete = 3, .precision = 2 };
-    const offset = app.term.screens.active.pages.scrollbar().offset;
-    app.write_queue.shrinkRetainingCapacity(1);
+    const offset = tb.term.screens.active.pages.scrollbar().offset;
+    tb.write_queue.shrinkRetainingCapacity(1);
     pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } });
     pointerEvent(app, .frame);
-    try std.testing.expectEqual(offset - 3, app.term.screens.active.pages.scrollbar().offset);
+    try std.testing.expectEqual(offset - 3, tb.term.screens.active.pages.scrollbar().offset);
     pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = -120 } });
     pointerEvent(app, .frame);
-    try std.testing.expectEqual(offset - 6, app.term.screens.active.pages.scrollbar().offset);
+    try std.testing.expectEqual(offset - 6, tb.term.screens.active.pages.scrollbar().offset);
     pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(-10) } });
     pointerEvent(app, .frame);
-    try std.testing.expectEqual(offset - 9, app.term.screens.active.pages.scrollbar().offset);
-    try std.testing.expectEqual(@as(usize, 1), app.write_queue.items.len);
+    try std.testing.expectEqual(offset - 9, tb.term.screens.active.pages.scrollbar().offset);
+    try std.testing.expectEqual(@as(usize, 1), tb.write_queue.items.len);
 
     stream.nextSlice("\x1b[?1049h");
     pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } });
     pointerEvent(app, .frame);
-    try std.testing.expectEqualStrings("\x1b[A\x1b[A\x1b[A", app.write_queue.items[1..]);
+    try std.testing.expectEqualStrings("\x1b[A\x1b[A\x1b[A", tb.write_queue.items[1..]);
 
     // A local half-line must not cancel the first opposite application detent.
     stream.nextSlice("\x1b[?1049l");
@@ -4456,32 +5344,32 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     pointerEvent(app, .frame);
     try std.testing.expectEqual(@as(f64, -0.5), app.scroll_line_remainder);
     stream.nextSlice("\x1b[?1000h");
-    app.write_queue.shrinkRetainingCapacity(1);
+    tb.write_queue.shrinkRetainingCapacity(1);
     pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 1 } });
     pointerEvent(app, .frame);
-    try std.testing.expectEqualStrings("\x1b[<65;1;1M", app.write_queue.items[1..]);
+    try std.testing.expectEqualStrings("\x1b[<65;1;1M", tb.write_queue.items[1..]);
 
     // The reverse handoff must not lend an application's partial detent to local scrolling.
     pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = 60 } });
     pointerEvent(app, .frame);
     stream.nextSlice("\x1b[?1000l");
-    const before = app.term.screens.active.pages.scrollbar().offset;
+    const before = tb.term.screens.active.pages.scrollbar().offset;
     pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 1 } });
     pointerEvent(app, .frame);
-    try std.testing.expectEqual(before, app.term.screens.active.pages.scrollbar().offset);
+    try std.testing.expectEqual(before, tb.term.screens.active.pages.scrollbar().offset);
     try std.testing.expectEqual(@as(f64, 0.5), app.scroll_line_remainder);
 
     // A frame without new scroll must not reinterpret pending local pixels as reports or keys.
     for ([_][]const u8{ "\x1b[?1000h", "\x1b[?1049h" }) |takeover| {
         stream.nextSlice("\x1b[?1000l\x1b[?1049l");
         app.config.mouse_scroll_multiplier.precision = 0.01;
-        app.write_queue.shrinkRetainingCapacity(1);
+        tb.write_queue.shrinkRetainingCapacity(1);
         pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(100) } });
         pointerEvent(app, .frame);
         try std.testing.expectEqual(@as(f64, 100), app.scroll_pixels);
         stream.nextSlice(takeover);
         pointerEvent(app, .frame);
-        try std.testing.expectEqualStrings("", app.write_queue.items[1..]);
+        try std.testing.expectEqualStrings("", tb.write_queue.items[1..]);
         try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
     }
 
@@ -4501,9 +5389,9 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
         try std.testing.expect(setTimer(app.fling_fd, .{ .it_value = timespecFromNs(1), .it_interval = .{ .sec = 0, .nsec = 0 } }, "test fling"));
         var fds = [_]posix.pollfd{.{ .fd = app.fling_fd, .events = posix.POLL.IN, .revents = 0 }};
         try std.testing.expectEqual(@as(usize, 1), try posix.poll(&fds, 1000));
-        app.write_queue.shrinkRetainingCapacity(1);
+        tb.write_queue.shrinkRetainingCapacity(1);
         app.fireFling();
-        try std.testing.expectEqualStrings("\x1b[<65;1;1M", app.write_queue.items[1..]);
+        try std.testing.expectEqualStrings("\x1b[<65;1;1M", tb.write_queue.items[1..]);
         try std.testing.expectEqual(@as(f64, 4), app.scroll_pixels);
         app.stopFling();
     }
@@ -4512,19 +5400,32 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     app.scroll_velocity = 3000;
     app.startFling();
     stream.nextSlice("\x1b[?1000l");
-    app.write_queue.shrinkRetainingCapacity(1);
+    tb.write_queue.shrinkRetainingCapacity(1);
     app.fireFling();
     try std.testing.expect(!app.fling_active);
     try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
     try std.testing.expectEqual(@as(f64, 0), app.scroll_velocity);
-    try std.testing.expectEqualStrings("", app.write_queue.items[1..]);
+    try std.testing.expectEqualStrings("", tb.write_queue.items[1..]);
 }
 
 test "application fling threshold ignores precision configuration" {
-    const app = try std.testing.allocator.create(App);
-    defer std.testing.allocator.destroy(app);
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
     app.config = .{};
-    app.term.flags.mouse_event = .normal;
+    const tb = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(tb);
+    defer tb.kitty_clipboard.deinit();
+    defer tb.write_queue.deinit(alloc);
+    app.tabs = .empty;
+    defer app.tabs.deinit(alloc);
+    try app.tabs.append(alloc, tb);
+    app.active = tb;
+    tb.app = app;
+    tb.term = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer tb.term.deinit(alloc);
+    tb.term.flags.mouse_event = .normal;
     app.fling_fd = try createTimerFd();
     defer _ = std.os.linux.close(app.fling_fd);
     for ([_]f64{ 0.01, 1, 10_000 }) |multiplier| {
@@ -4613,7 +5514,7 @@ fn scrollbarRowForThumbY(geometry: ScrollbarGeometry, thumb_y: f64) usize {
 
 fn currentScrollbarGeometry(self: *App, alpha: u8) ?ScrollbarGeometry {
     return scrollbarGeometry(
-        self.term.screens.active.pages.scrollbar(),
+        self.tab().term.screens.active.pages.scrollbar(),
         self.layout,
         self.window.scale120,
         alpha,
@@ -4621,7 +5522,7 @@ fn currentScrollbarGeometry(self: *App, alpha: u8) ?ScrollbarGeometry {
 }
 
 fn currentScrollbarThumb(self: *App) ?Renderer.ScrollbarThumb {
-    const scrollbar = self.term.screens.active.pages.scrollbar();
+    const scrollbar = self.tab().term.screens.active.pages.scrollbar();
     if (!scrollbarShouldRender(scrollbar, self.scrollbar_alpha)) return null;
     const geometry = scrollbarGeometry(scrollbar, self.layout, self.window.scale120, self.scrollbar_alpha) orelse return null;
     return geometry.thumb;
@@ -4693,7 +5594,7 @@ fn hideScrollbar(self: *App) void {
 }
 
 fn revealScrollbar(self: *App) void {
-    const scrollbar = self.term.screens.active.pages.scrollbar();
+    const scrollbar = self.tab().term.screens.active.pages.scrollbar();
     const at_bottom = scrollbarAtBottom(scrollbar);
     self.scrollbar_fading = false;
     self.scrollbar_fade_elapsed_ms = 0;
@@ -4714,7 +5615,7 @@ fn revealScrollbar(self: *App) void {
 
 fn fireScrollbarFade(self: *App) void {
     const expirations = readTimer(self.scrollbar_fd) orelse return;
-    const at_bottom = scrollbarAtBottom(self.term.screens.active.pages.scrollbar());
+    const at_bottom = scrollbarAtBottom(self.tab().term.screens.active.pages.scrollbar());
     if (self.scrollbar_drag != null or self.scrollbar_hovered or self.scrollbar_alpha == 0 or
         (self.scrollbar_reveal_hovered and !at_bottom)) return;
 
@@ -4780,7 +5681,10 @@ fn scrollLines(self: *App, lines_down: i32) void {
         return;
     }
 
-    self.term.screens.active.pages.scroll(.{ .delta_row = lines_down });
+    self.tab().term.screens.active.pages.scroll(.{ .delta_row = lines_down });
+    // Scrolling changes which terminal pin is under a stationary pointer.
+    // Pointer motion normally advances an active drag, so do the same here
+    // after the viewport has moved.
     if (self.selecting) self.extendSelection();
     self.revealScrollbar();
     self.needs_redraw = true;
@@ -4790,7 +5694,7 @@ fn scrollLines(self: *App, lines_down: i32) void {
 fn sendMouseEvent(self: *App, event: vt.input.MouseEncodeEvent) void {
     var buf: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
-    var opts = vt.input.MouseEncodeOptions.fromTerminal(&self.term, .{
+    var opts = vt.input.MouseEncodeOptions.fromTerminal(&self.tab().term, .{
         .screen = .{
             .width = self.layout.surface_width,
             .height = self.layout.surface_height,
@@ -4805,7 +5709,7 @@ fn sendMouseEvent(self: *App, event: vt.input.MouseEncodeEvent) void {
     });
     opts.any_button_pressed = event.action == .press or self.mouse_button != null;
     vt.input.encodeMouse(&writer, event, opts) catch return;
-    self.writePty(writer.buffered());
+    self.tab().writePty(writer.buffered());
 }
 
 /// Pointer position in physical (buffer) pixels, as mouse encoding expects.
@@ -4890,11 +5794,11 @@ fn setFocus(self: *App, focused: bool) void {
     self.focused = focused;
     self.requestFullAsyncRedraw();
     // Applications with focus reporting (mode 1004) get CSI I / CSI O.
-    if (self.term.modes.get(.focus_event)) {
+    if (self.tab().term.modes.get(.focus_event)) {
         var buf: [vt.input.max_focus_encode_size]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
         vt.input.encodeFocus(&writer, if (focused) .gained else .lost) catch return;
-        self.writePty(writer.buffered());
+        self.tab().writePty(writer.buffered());
     }
 }
 
@@ -4902,9 +5806,9 @@ fn setFocus(self: *App, focused: bool) void {
 /// hidden. Every other state remains conservatively potentially visible.
 fn syncTerminalVisibility(self: *App) void {
     const visible = !self.window.suspended;
-    if (self.term.flags.visible == visible) return;
-    self.term.flags.visible = visible;
-    if (!self.term.modes.get(.report_visibility)) return;
+    if (self.tab().term.flags.visible == visible) return;
+    self.tab().term.flags.visible = visible;
+    if (!self.tab().term.modes.get(.report_visibility)) return;
 
     var buf: [vt.device_status.max_visibility_report_encode_size]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -4912,7 +5816,7 @@ fn syncTerminalVisibility(self: *App) void {
         &writer,
         if (visible) .potentially_visible else .not_visible,
     ) catch return;
-    self.writePty(writer.buffered());
+    self.tab().writePty(writer.buffered());
 }
 
 fn textInputEvent(ctx: *anyopaque, event: zwp.TextInputV3.Event) void {
@@ -4942,7 +5846,7 @@ fn textInputEvent(ctx: *anyopaque, event: zwp.TextInputV3.Event) void {
 }
 
 fn applyPendingIme(self: *App) void {
-    if (self.search != null) {
+    if (self.tab().search != null) {
         if (self.ime_pending_commit) |commit| self.appendSearchText(commit);
         self.setImePreedit(self.ime_pending_preedit);
         self.resetPendingIme();
@@ -4950,10 +5854,10 @@ fn applyPendingIme(self: *App) void {
     }
     if (self.ime_pending_commit) |commit| {
         if (commit.len > 0) {
-            self.writePty(commit);
+            self.tab().writePty(commit);
             self.clearSelection();
-            if (self.term.screens.active.pages.viewport != .active) {
-                self.term.screens.active.pages.scroll(.active);
+            if (self.tab().term.screens.active.pages.viewport != .active) {
+                self.tab().term.screens.active.pages.scroll(.active);
                 self.revealScrollbar();
                 self.syncHoveredLink(true);
             }
@@ -5069,7 +5973,7 @@ fn fireKittyAnimation(self: *App) void {
 }
 
 fn syncScrollbackCompression(self: *App) void {
-    const activity = self.term.compressionActivity();
+    const activity = self.tab().term.compressionActivity();
     if (activity == self.compression_activity) return;
     self.compression_activity = activity;
     self.armScrollbackCompression(compression_idle_ms);
@@ -5078,14 +5982,14 @@ fn syncScrollbackCompression(self: *App) void {
 fn fireScrollbackCompression(self: *App) void {
     _ = readTimer(self.compression_fd) orelse return;
 
-    const activity = self.term.compressionActivity();
+    const activity = self.tab().term.compressionActivity();
     if (activity != self.compression_activity) {
         self.compression_activity = activity;
         self.armScrollbackCompression(compression_idle_ms);
         return;
     }
 
-    if (self.term.compress(.incremental) == .pending) {
+    if (self.tab().term.compress(.incremental) == .pending) {
         self.armScrollbackCompression(compression_step_ms);
     }
 }
@@ -5098,8 +6002,8 @@ fn armScrollbackCompression(self: *App, delay_ms: u64) void {
 }
 
 fn startSearch(self: *App) void {
-    if (self.search != null) return;
-    self.search = ScrollbackSearch.init(&self.term) catch |err| {
+    if (self.tab().search != null) return;
+    self.tab().search = ScrollbackSearch.init(&self.tab().term) catch |err| {
         log.warn("failed to start scrollback search: {}", .{err});
         return;
     };
@@ -5110,24 +6014,24 @@ fn startSearch(self: *App) void {
 
 fn finishSearch(self: *App, accept: bool) void {
     var accepted: ?vt.Selection = null;
-    if (self.search) |*search| {
-        if (accept and search.engineValid(&self.term) and
-            search.engine_key == self.term.screens.active_key)
+    if (self.tab().search) |*search| {
+        if (accept and search.engineValid(&self.tab().term) and
+            search.engine_key == self.tab().term.screens.active_key)
         {
             if (search.engine.?.selectedMatch()) |match| {
                 accepted = .init(match.startPin(), match.endPin(), false);
             }
         } else if (!accept) {
-            search.restoreViewport(&self.term);
+            search.restoreViewport(&self.tab().term);
         }
-        search.deinit(self.alloc, &self.term);
-        self.search = null;
+        search.deinit(self.alloc, &self.tab().term);
+        self.tab().search = null;
     }
     self.stopSearchTimer();
     self.clearImeText();
     self.revealScrollbar();
     if (accepted) |selection| {
-        self.term.screens.active.select(selection) catch |err| {
+        self.tab().term.screens.active.select(selection) catch |err| {
             log.warn("failed to select accepted search match: {}", .{err});
             self.requestFullAsyncRedraw();
             return;
@@ -5139,21 +6043,21 @@ fn finishSearch(self: *App, accept: bool) void {
 }
 
 fn rebuildSearch(self: *App) void {
-    const search = if (self.search) |*value| value else return;
-    search.deinitEngine(&self.term);
+    const search = if (self.tab().search) |*value| value else return;
+    search.deinitEngine(&self.tab().term);
     self.stopSearchTimer();
     if (search.query.items.len == 0) {
-        search.restoreViewport(&self.term);
+        search.restoreViewport(&self.tab().term);
         self.revealScrollbar();
         self.syncHoveredLink(true);
         self.requestFullAsyncRedraw();
         return;
     }
 
-    const key = self.term.screens.active_key;
+    const key = self.tab().term.screens.active_key;
     search.engine = vt.search.Screen.init(
         self.alloc,
-        self.term.screens.active,
+        self.tab().term.screens.active,
         search.query.items,
     ) catch |err| {
         log.warn("failed to initialize scrollback search: {}", .{err});
@@ -5161,7 +6065,7 @@ fn rebuildSearch(self: *App) void {
         return;
     };
     search.engine_key = key;
-    search.engine_generation = self.term.screens.generation(key);
+    search.engine_generation = self.tab().term.screens.generation(key);
     search.complete = false;
     self.ensureSearchSelection();
     self.startSearchTimer();
@@ -5170,11 +6074,14 @@ fn rebuildSearch(self: *App) void {
 
 /// Reconcile search with live terminal output. Screen generations make it
 /// safe to release an engine after an alternate screen was destroyed.
-fn refreshSearch(self: *App) void {
-    const search = if (self.search) |*value| value else return;
+fn refreshSearch(self: *App, tb: *Tab) void {
+    // Incremental search is a view-level UI feature that only scans the
+    // visible tab; a background tab's match set is refreshed on activation.
+    if (tb != self.active) return;
+    const search = if (self.tab().search) |*value| value else return;
     if (search.query.items.len == 0) return;
-    if (!search.engineValid(&self.term) or
-        search.engine_key != self.term.screens.active_key)
+    if (!search.engineValid(&self.tab().term) or
+        search.engine_key != self.tab().term.screens.active_key)
     {
         self.rebuildSearch();
         return;
@@ -5204,7 +6111,7 @@ fn stopSearchTimer(self: *App) void {
 
 fn fireSearch(self: *App) void {
     _ = readTimer(self.search_fd) orelse return;
-    var search = if (self.search) |*value| value else {
+    var search = if (self.tab().search) |*value| value else {
         self.stopSearchTimer();
         return;
     };
@@ -5212,7 +6119,7 @@ fn fireSearch(self: *App) void {
         self.stopSearchTimer();
         return;
     }
-    if (!search.engineValid(&self.term)) {
+    if (!search.engineValid(&self.tab().term)) {
         self.rebuildSearch();
         return;
     }
@@ -5246,7 +6153,7 @@ fn fireSearch(self: *App) void {
     }
     self.ensureSearchSelection();
 
-    search = &self.search.?;
+    search = &self.tab().search.?;
     const after_selected: ?usize = if (search.engine.?.selected) |selected| selected.idx else null;
     if (before_matches != search.engine.?.matchesLen() or
         before_selected != after_selected or before_complete != search.complete)
@@ -5256,9 +6163,9 @@ fn fireSearch(self: *App) void {
 }
 
 fn ensureSearchSelection(self: *App) void {
-    const search = if (self.search) |*value| value else return;
-    if (!search.engineValid(&self.term) or
-        search.engine_key != self.term.screens.active_key) return;
+    const search = if (self.tab().search) |*value| value else return;
+    if (!search.engineValid(&self.tab().term) or
+        search.engine_key != self.tab().term.screens.active_key) return;
     const engine = &search.engine.?;
     if (engine.selected == null and engine.matchesLen() > 0) {
         _ = engine.select(.next) catch |err| {
@@ -5270,9 +6177,9 @@ fn ensureSearchSelection(self: *App) void {
 }
 
 fn selectSearch(self: *App, direction: vt.search.Screen.Select) void {
-    const search = if (self.search) |*value| value else return;
-    if (!search.engineValid(&self.term) or
-        search.engine_key != self.term.screens.active_key) return;
+    const search = if (self.tab().search) |*value| value else return;
+    if (!search.engineValid(&self.tab().term) or
+        search.engine_key != self.tab().term.screens.active_key) return;
     _ = search.engine.?.select(direction) catch |err| {
         log.warn("failed to move scrollback search selection: {}", .{err});
         return;
@@ -5282,9 +6189,9 @@ fn selectSearch(self: *App, direction: vt.search.Screen.Select) void {
 }
 
 fn scrollToSearchSelection(self: *App) void {
-    const search = if (self.search) |*value| value else return;
-    if (!search.engineValid(&self.term) or
-        search.engine_key != self.term.screens.active_key) return;
+    const search = if (self.tab().search) |*value| value else return;
+    if (!search.engineValid(&self.tab().term) or
+        search.engine_key != self.tab().term.screens.active_key) return;
     const match = search.engine.?.selectedMatch() orelse return;
     const screen = search.engine.?.screen;
     if (!searchMatchVisible(screen, match)) {
@@ -5313,7 +6220,7 @@ fn searchMatchVisible(screen: *vt.Screen, match: vt.highlight.Flattened) bool {
 
 fn appendSearchText(self: *App, text: []const u8) void {
     if (text.len == 0) return;
-    const search = if (self.search) |*value| value else return;
+    const search = if (self.tab().search) |*value| value else return;
     if (search.query.items.len + text.len > max_search_query_bytes) return;
     search.query.appendSlice(self.alloc, text) catch |err| {
         log.warn("failed to edit scrollback search: {}", .{err});
@@ -5323,7 +6230,7 @@ fn appendSearchText(self: *App, text: []const u8) void {
 }
 
 fn backspaceSearch(self: *App) void {
-    const search = if (self.search) |*value| value else return;
+    const search = if (self.tab().search) |*value| value else return;
     if (!truncateLastUtf8(&search.query)) return;
     self.rebuildSearch();
 }
@@ -5344,7 +6251,7 @@ fn handleSearchKey(self: *App, event: vt.input.KeyEvent) void {
             'p' => self.selectSearch(.next),
             'c', 'g' => self.finishSearch(false),
             'u' => {
-                const search = if (self.search) |*value| value else return;
+                const search = if (self.tab().search) |*value| value else return;
                 if (search.query.items.len == 0) return;
                 search.query.clearRetainingCapacity();
                 self.rebuildSearch();
@@ -5403,13 +6310,13 @@ fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: ScrollbackK
     if (event.action == .release) return;
 
     self.stopFling();
-    const rows: isize = @intCast(self.term.rows);
+    const rows: isize = @intCast(self.tab().term.rows);
     switch (scroll) {
-        .lines => |lines| self.term.screens.active.pages.scroll(.{ .delta_row = lines }),
-        .page_up => self.term.screens.active.pages.scroll(.{ .delta_row = -rows }),
-        .page_down => self.term.screens.active.pages.scroll(.{ .delta_row = rows }),
-        .top => self.term.screens.active.pages.scroll(.top),
-        .bottom => self.term.screens.active.pages.scroll(.active),
+        .lines => |lines| self.tab().term.screens.active.pages.scroll(.{ .delta_row = lines }),
+        .page_up => self.tab().term.screens.active.pages.scroll(.{ .delta_row = -rows }),
+        .page_down => self.tab().term.screens.active.pages.scroll(.{ .delta_row = rows }),
+        .top => self.tab().term.screens.active.pages.scroll(.top),
+        .bottom => self.tab().term.screens.active.pages.scroll(.active),
         .passthrough => unreachable,
     }
     self.revealScrollbar();
@@ -5421,9 +6328,9 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     var utf8_buf: [16]u8 = undefined;
     const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
 
-    if (self.search != null) return self.handleSearchKey(event);
+    if (self.tab().search != null) return self.handleSearchKey(event);
 
-    if (scrollbackKeyAction(&self.config, self.term.screens.active_key, event)) |scroll| {
+    if (scrollbackKeyAction(&self.config, self.tab().term.screens.active_key, event)) |scroll| {
         if (scroll != .passthrough) return self.handleScrollbackKey(event, scroll);
     } else {
         // Shift is only allowed on `=` (for `Ctrl++`); ctrl+_ and ctrl+) belong to the application.
@@ -5442,11 +6349,24 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
                 'c' => return self.copyToClipboard(),
                 'f' => return self.startSearch(),
                 'g' => return self.pipeCommandOutput(),
-                'n' => return self.spawnNewWindow(),
+                'h' => return self.prevTab(),
+                'l' => return self.nextTab(),
+                'n' => return self.openNewSession(),
+                't' => return self.newTab(),
+                'q' => return self.closeTab(),
+                'w' => return self.closeTab(),
                 'v' => return self.beginPaste(.clipboard),
                 'x' => return self.jumpPrompt(1),
                 'z' => return self.jumpPrompt(-1),
-                ',' => return self.reloadConfig(),
+                ',' => return self.moveTab(-1),
+                '.' => return self.moveTab(1),
+                else => {},
+            }
+            // Ctrl+Shift+PageUp/PageDown cycle tabs.
+            switch (event.key) {
+                .page_up => return self.prevTab(),
+                .page_down => return self.nextTab(),
+                .f5 => return self.reloadConfig(),
                 else => {},
             }
         }
@@ -5460,8 +6380,8 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     if (wrote and action != .release and !event.key.modifier()) {
         self.stopFling();
         self.clearSelection();
-        if (self.term.screens.active.pages.viewport != .active) {
-            self.term.screens.active.pages.scroll(.active);
+        if (self.tab().term.screens.active.pages.viewport != .active) {
+            self.tab().term.screens.active.pages.scroll(.active);
             self.revealScrollbar();
             self.needs_redraw = true;
             self.syncHoveredLink(true);
@@ -5472,80 +6392,18 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
 fn encodeAndWriteKey(self: *App, event: vt.input.KeyEvent) bool {
     var out_buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&out_buf);
-    vt.input.encodeKey(&writer, event, .fromTerminal(&self.term)) catch |err| {
+    vt.input.encodeKey(&writer, event, .fromTerminal(&self.tab().term)) catch |err| {
         log.err("key encode failed: {}", .{err});
         return false;
     };
     const bytes = writer.buffered();
     if (bytes.len == 0) return false;
-    self.writePty(bytes);
+    self.tab().writePty(bytes);
     return true;
 }
 
 // Includes headroom for base64 framing of a maximum-sized clipboard read.
-const max_pty_write_queue = 4 * 1024 * 1024;
-
-/// Accept the entire write or drop it before emitting any bytes. Reserve the
-/// possible backlog first so neither backpressure nor OOM truncates a reply.
-fn writePty(self: *App, bytes: []const u8) void {
-    std.debug.assert(self.write_queue_offset <= self.write_queue.items.len);
-    const pending = self.write_queue.items.len - self.write_queue_offset;
-    if (bytes.len > max_pty_write_queue -| pending) {
-        log.warn("pty write queue full; dropping complete write ({d} bytes)", .{bytes.len});
-        return;
-    }
-    // Only move the tail when at least as many bytes have been consumed.
-    // Otherwise grow: compacting after every small drain would be quadratic.
-    if (self.write_queue.capacity - self.write_queue.items.len < bytes.len and
-        self.write_queue_offset >= pending)
-    {
-        std.mem.copyForwards(u8, self.write_queue.items[0..pending], self.write_queue.items[self.write_queue_offset..]);
-        self.write_queue.items.len = pending;
-        self.write_queue_offset = 0;
-    }
-    self.write_queue.ensureUnusedCapacity(self.alloc, bytes.len) catch |err| {
-        log.warn("pty write queue reserve failed: {}", .{err});
-        return;
-    };
-    // A backlog exists; keep ordering by appending behind it.
-    if (pending > 0) {
-        self.write_queue.appendSliceAssumeCapacity(bytes);
-        return;
-    }
-    const written = self.tryPtyWrite(bytes);
-    self.write_queue.appendSliceAssumeCapacity(bytes[written..]);
-}
-
-/// Drain the backlog after the master polled writable.
-fn flushWriteQueue(self: *App) void {
-    self.write_queue_offset += self.tryPtyWrite(self.write_queue.items[self.write_queue_offset..]);
-    if (self.write_queue_offset == self.write_queue.items.len) {
-        self.write_queue.clearRetainingCapacity();
-        self.write_queue_offset = 0;
-    }
-}
-
-/// Write as much as the kernel accepts; returns the number of bytes
-/// consumed. Never blocks.
-fn tryPtyWrite(self: *App, bytes: []const u8) usize {
-    const linux = std.os.linux;
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const rc = linux.write(self.pty.master, bytes.ptr + offset, bytes.len - offset);
-        switch (linux.errno(rc)) {
-            .SUCCESS => offset += rc,
-            .INTR => continue,
-            .AGAIN => break,
-            // EIO: child gone; the read side notices and shuts down.
-            .IO => break,
-            else => |err| {
-                log.err("pty write failed: {}", .{err});
-                break;
-            },
-        }
-    }
-    return offset;
-}
+const max_pty_write_queue = Tab.max_pty_write_queue;
 
 test "maximum clipboard response survives write backpressure in order" {
     const alloc = std.testing.allocator;
@@ -5554,13 +6412,14 @@ test "maximum clipboard response survives write backpressure in order" {
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
+    const tb = pipeBackedTab(alloc, fds[1]);
+    defer alloc.destroy(tb);
+    defer tb.write_queue.deinit(alloc);
     const app = try alloc.create(App);
     defer alloc.destroy(app);
     app.alloc = alloc;
-    app.pty.master = fds[1];
-    app.write_queue = .empty;
-    app.write_queue_offset = 0;
-    defer app.write_queue.deinit(alloc);
+    app.active = tb;
+    app.tabs = .empty;
 
     const clipboard = try alloc.alloc(u8, 1024 * 1024);
     defer alloc.free(clipboard);
@@ -5570,9 +6429,9 @@ test "maximum clipboard response survives write backpressure in order" {
     try formatOsc52ClipboardReport(&expected.writer, 'c', clipboard);
     try expected.writer.writeAll("following input");
 
-    app.writeOsc52ClipboardReport('c', clipboard);
-    try std.testing.expect(app.write_queue.items.len > 1024 * 1024);
-    app.writePty("following input");
+    app.writeOsc52ClipboardReport(tb, 'c', clipboard);
+    try std.testing.expect(tb.write_queue.items.len > 1024 * 1024);
+    tb.writePty("following input");
     var received: usize = 0;
     var buf: [16 * 1024]u8 = undefined;
     while (received < expected.written().len) {
@@ -5580,16 +6439,16 @@ test "maximum clipboard response survives write backpressure in order" {
         try std.testing.expect(n > 0);
         try std.testing.expectEqualSlices(u8, expected.written()[received..][0..n], buf[0..n]);
         received += n;
-        const queued_len = app.write_queue.items.len;
-        const queued_offset = app.write_queue_offset;
-        app.flushWriteQueue();
-        if (app.write_queue.items.len > 0) {
-            try std.testing.expectEqual(queued_len, app.write_queue.items.len);
-            try std.testing.expect(app.write_queue_offset > queued_offset);
+        const queued_len = tb.write_queue.items.len;
+        const queued_offset = tb.write_queue_offset;
+        tb.flushWriteQueue();
+        if (tb.write_queue.items.len > 0) {
+            try std.testing.expectEqual(queued_len, tb.write_queue.items.len);
+            try std.testing.expect(tb.write_queue_offset > queued_offset);
         }
     }
-    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.write_queue_offset);
+    try std.testing.expectEqual(@as(usize, 0), tb.write_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), tb.write_queue_offset);
 }
 
 test "PTY limit and allocation failure reject before writing a prefix" {
@@ -5599,72 +6458,67 @@ test "PTY limit and allocation failure reject before writing a prefix" {
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
-    const app = try alloc.create(App);
-    defer alloc.destroy(app);
-    app.alloc = alloc;
-    app.pty.master = fds[1];
-    app.write_queue = .empty;
-    app.write_queue_offset = 0;
-    defer app.write_queue.deinit(alloc);
+    const tb = pipeBackedTab(alloc, fds[1]);
+    defer alloc.destroy(tb);
+    defer tb.write_queue.deinit(alloc);
     const oversized = try alloc.alloc(u8, max_pty_write_queue + 1);
     defer alloc.free(oversized);
     @memset(oversized, 'x');
-    app.writePty(oversized);
+    tb.writePty(oversized);
     var byte: [1]u8 = undefined;
     try std.testing.expectError(error.WouldBlock, posix.read(fds[0], &byte));
-    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), tb.write_queue.items.len);
 
     var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
-    app.alloc = failing.allocator();
-    app.writePty("reply");
+    tb.alloc = failing.allocator();
+    tb.writePty("reply");
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectError(error.WouldBlock, posix.read(fds[0], &byte));
-    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), tb.write_queue.items.len);
 }
 
 test "PTY enqueue counts unread bytes and amortizes compaction" {
     const alloc = std.testing.allocator;
-    const app = try alloc.create(App);
-    defer alloc.destroy(app);
-    app.alloc = alloc;
-    app.write_queue = try .initCapacity(alloc, max_pty_write_queue);
-    defer app.write_queue.deinit(alloc);
-    app.write_queue.items.len = max_pty_write_queue;
-    for (app.write_queue.items, 0..) |*byte, i| byte.* = @truncate(i);
+    const tb = pipeBackedTab(alloc, -1);
+    defer alloc.destroy(tb);
+    tb.write_queue = try .initCapacity(alloc, max_pty_write_queue);
+    defer tb.write_queue.deinit(alloc);
+    tb.write_queue.items.len = max_pty_write_queue;
+    for (tb.write_queue.items, 0..) |*byte, i| byte.* = @truncate(i);
 
     // A small consumed prefix doesn't trigger a large tail copy, and does
     // not count against the logical cap. Reserve failure keeps it intact.
-    app.write_queue_offset = 1;
+    tb.write_queue_offset = 1;
     var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0, .resize_fail_index = 0 });
-    app.alloc = failing.allocator();
-    app.writePty("x");
+    tb.alloc = failing.allocator();
+    tb.writePty("x");
     try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(@as(usize, 1), app.write_queue_offset);
-    try std.testing.expectEqual(@as(usize, max_pty_write_queue), app.write_queue.items.len);
-    app.alloc = alloc;
-    app.writePty("x");
-    try std.testing.expectEqual(@as(usize, 1), app.write_queue_offset);
-    try std.testing.expectEqual(@as(usize, max_pty_write_queue + 1), app.write_queue.items.len);
-    app.writePty("rejected");
-    try std.testing.expectEqual(@as(usize, max_pty_write_queue + 1), app.write_queue.items.len);
-    try std.testing.expectEqual(@as(u8, 'x'), app.write_queue.items[max_pty_write_queue]);
+    try std.testing.expectEqual(@as(usize, 1), tb.write_queue_offset);
+    try std.testing.expectEqual(@as(usize, max_pty_write_queue), tb.write_queue.items.len);
+    tb.alloc = alloc;
+    tb.writePty("x");
+    try std.testing.expectEqual(@as(usize, 1), tb.write_queue_offset);
+    try std.testing.expectEqual(@as(usize, max_pty_write_queue + 1), tb.write_queue.items.len);
+    tb.writePty("rejected");
+    try std.testing.expectEqual(@as(usize, max_pty_write_queue + 1), tb.write_queue.items.len);
+    try std.testing.expectEqual(@as(u8, 'x'), tb.write_queue.items[max_pty_write_queue]);
 
     // With enough consumed bytes, reclaim the prefix instead of growing.
-    app.write_queue.items.len = app.write_queue.capacity;
-    @memset(app.write_queue.items, 0);
-    app.write_queue_offset = app.write_queue.items.len - 4;
-    @memcpy(app.write_queue.items[app.write_queue_offset..], "tail");
-    const capacity = app.write_queue.capacity;
-    app.writePty("next");
-    try std.testing.expectEqual(capacity, app.write_queue.capacity);
-    try std.testing.expectEqual(@as(usize, 0), app.write_queue_offset);
-    try std.testing.expectEqualStrings("tailnext", app.write_queue.items);
+    tb.write_queue.items.len = tb.write_queue.capacity;
+    @memset(tb.write_queue.items, 0);
+    tb.write_queue_offset = tb.write_queue.items.len - 4;
+    @memcpy(tb.write_queue.items[tb.write_queue_offset..], "tail");
+    const capacity = tb.write_queue.capacity;
+    tb.writePty("next");
+    try std.testing.expectEqual(capacity, tb.write_queue.capacity);
+    try std.testing.expectEqual(@as(usize, 0), tb.write_queue_offset);
+    try std.testing.expectEqualStrings("tailnext", tb.write_queue.items);
 }
 
 fn searchRangeForRender(self: *App) ?Renderer.LinkRange {
-    const search = if (self.search) |*value| value else return null;
-    if (!search.engineValid(&self.term) or
-        search.engine_key != self.term.screens.active_key)
+    const search = if (self.tab().search) |*value| value else return null;
+    if (!search.engineValid(&self.tab().term) or
+        search.engine_key != self.tab().term.screens.active_key)
     {
         return null;
     }
@@ -5673,15 +6527,15 @@ fn searchRangeForRender(self: *App) ?Renderer.LinkRange {
         search.engine.?.screen,
         match.startPin(),
         match.endPin(),
-        self.term.rows,
-        self.term.cols,
+        self.tab().term.rows,
+        self.tab().term.cols,
     );
 }
 
 fn searchMatchesForRender(self: *App) !std.ArrayList(bool) {
-    const search = if (self.search) |*value| value else return .empty;
-    if (search.query.items.len == 0 or !search.engineValid(&self.term) or
-        search.engine_key != self.term.screens.active_key)
+    const search = if (self.tab().search) |*value| value else return .empty;
+    if (search.query.items.len == 0 or !search.engineValid(&self.tab().term) or
+        search.engine_key != self.tab().term.screens.active_key)
     {
         return .empty;
     }
@@ -5689,8 +6543,8 @@ fn searchMatchesForRender(self: *App) !std.ArrayList(bool) {
         self.alloc,
         search.engine.?.screen,
         search.query.items,
-        self.term.rows,
-        self.term.cols,
+        self.tab().term.rows,
+        self.tab().term.cols,
     );
 }
 
@@ -5737,9 +6591,9 @@ fn markSearchRange(mask: []bool, cols: u16, range: Renderer.LinkRange) void {
 }
 
 fn searchNoMatch(self: *App) bool {
-    const search = if (self.search) |*value| value else return false;
+    const search = if (self.tab().search) |*value| value else return false;
     if (search.query.items.len == 0 or self.ime_preedit != null or
-        !search.complete or !search.engineValid(&self.term))
+        !search.complete or !search.engineValid(&self.tab().term))
     {
         return false;
     }
@@ -5747,9 +6601,9 @@ fn searchNoMatch(self: *App) bool {
 }
 
 fn searchOverlayText(self: *App) !?[]u8 {
-    const search = if (self.search) |*value| value else return null;
+    const search = if (self.tab().search) |*value| value else return null;
     const preedit: []const u8 = self.ime_preedit orelse "";
-    if (!search.engineValid(&self.term)) {
+    if (!search.engineValid(&self.tab().term)) {
         return try std.fmt.allocPrint(self.alloc, "Search: {s}{s}", .{
             search.query.items,
             preedit,
@@ -5773,6 +6627,69 @@ fn searchOverlayText(self: *App) !?[]u8 {
         search.query.items,
         preedit,
     });
+}
+
+/// Build an owned snapshot of the currently-visible tabs for the tab bar.
+/// All returned titles are owned by the caller (freed by freeTabBarSnapshot);
+/// the caller must hand the slice to replaceTabBar, which dups it again for
+/// the in-flight job.
+fn tabBarSnapshot(self: *App) ![]Renderer.TabBarItem {
+    var items: std.ArrayList(Renderer.TabBarItem) = .empty;
+    errdefer {
+        for (items.items) |item| self.alloc.free(item.title);
+        items.deinit(self.alloc);
+    }
+    for (self.tabs.items, 0..) |tb, i| {
+        const title = if (tb.term.getTitle()) |text|
+            if (text.len > 0) try self.alloc.dupe(u8, text) else try self.tabProcessTitle(tb, i)
+        else
+            try self.tabProcessTitle(tb, i);
+        try items.append(self.alloc, .{ .title = title, .active = tb == self.active });
+    }
+    return items.toOwnedSlice(self.alloc);
+}
+
+/// Use the foreground process-group leader when no application title is set.
+/// A full-screen child such as nvim can clear OSC 2 before returning to its
+/// parent; the PTY foreground group still identifies yazi (or the shell at a
+/// prompt), so the tab does not degrade to an opaque numeric label.
+fn tabProcessTitle(self: *App, tb: *Tab, index: usize) ![]u8 {
+    var foreground_pid: posix.pid_t = undefined;
+    const rc = std.os.linux.tcgetpgrp(tb.pty.master, &foreground_pid);
+    if (std.os.linux.errno(rc) != .SUCCESS) foreground_pid = tb.child_pid;
+    if (try self.processName(foreground_pid)) |name| return name;
+    if (foreground_pid != tb.child_pid) {
+        if (try self.processName(tb.child_pid)) |name| return name;
+    }
+    return std.fmt.allocPrint(self.alloc, "{d}", .{index + 1});
+}
+
+/// Read and own Linux's short, stable process name.
+fn processName(self: *App, pid: posix.pid_t) std.mem.Allocator.Error!?[]u8 {
+    if (pid <= 0) return null;
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return null;
+    const file = std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch return null;
+    defer file.close(self.io);
+
+    var name_buf: [256]u8 = undefined;
+    const len = posix.read(file.handle, &name_buf) catch return null;
+    const name = std.mem.trim(u8, name_buf[0..len], " \t\r\n");
+    if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) return null;
+    return try self.alloc.dupe(u8, name);
+}
+
+fn freeTabBarSnapshot(self: *App, items: []Renderer.TabBarItem) void {
+    for (items) |item| self.alloc.free(item.title);
+    self.alloc.free(items);
+}
+
+fn tabBarEqual(a: []const Renderer.TabBarItem, b: []const Renderer.TabBarItem) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.active != y.active or !std.mem.eql(u8, x.title, y.title)) return false;
+    }
+    return true;
 }
 
 const AsyncRenderStart = enum { submitted, no_work, deferred };
@@ -5808,16 +6725,17 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
     // (and its overlay/kitty copies) is re-rendered as-is — reachable
     // only for geometry redraws. Any pending snapshot rebuild stays
     // deferred until the freeze ends.
-    const frozen = self.term.modes.get(.synchronized_output);
+    const frozen = self.tab().term.modes.get(.synchronized_output);
     var hyperlink_hints = self.linksActive();
     // Frozen jobs re-render the previous snapshot at a new geometry, so
     // they never take the unchanged-overlay shortcut.
     var overlay_dirty = true;
+    var tab_bar_dirty = true;
     var scroll: ?ScrollDetector.Scroll = null;
     var old_cursor: vt.RenderState.Cursor = self.render_state.cursor;
     if (!frozen) {
         self.tickKittyAnimations();
-        const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
+        const has_kitty_graphics = self.tab().term.screens.active.kitty_images.placements.count() > 0;
         const new_scrollbar = self.currentScrollbarThumb();
         // Detection must precede update(). Both the previous and next frame
         // must be free of overlays because their pixels do not move with
@@ -5826,18 +6744,18 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             !hyperlink_hints and !self.async_job.hyperlink_hints and
             self.ime_preedit == null and self.async_job.preedit == null and
             self.async_job.link_hint == null and
-            self.search == null and self.async_job.search == null and
+            self.tab().search == null and self.async_job.search == null and
             new_scrollbar == null and self.async_job.scrollbar == null and
             !has_kitty_graphics and self.async_job.kitty.len == 0)
         {
-            scroll = try self.scroll_detector.detect(self.alloc, &self.render_state, &self.term);
+            scroll = try self.scroll_detector.detect(self.alloc, &self.render_state, &self.tab().term);
         }
         if (self.async_force_full) {
             self.render_state.rows = 0;
             self.render_state.dirty = .full;
         }
         old_cursor = self.render_state.cursor;
-        try self.render_state.update(self.alloc, &self.term);
+        try self.render_state.update(self.alloc, &self.tab().term);
         self.dirtyCursorRows(old_cursor);
         const cursor_was_animating = self.cursor_anim_moving;
         self.syncCursorAnimator();
@@ -5863,7 +6781,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         const hovered = if (hyperlink_hints) self.hovered_link else null;
         const new_link: ?[]const u8 = if (hovered) |link| link.uri else null;
         const new_range: ?Renderer.LinkRange = if (hovered) |link| link.range else null;
-        const new_preedit: ?[]const u8 = if (self.search == null) self.ime_preedit else null;
+        const new_preedit: ?[]const u8 = if (self.tab().search == null) self.ime_preedit else null;
         var new_search_matches = try self.searchMatchesForRender();
         errdefer new_search_matches.deinit(self.alloc);
         const new_search = try self.searchOverlayText();
@@ -5880,19 +6798,25 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             !std.meta.eql(self.async_job.scrollbar, new_scrollbar);
         try self.async_job.replaceOverlays(self.alloc, new_preedit, new_link, new_search, new_search_no_match, new_range, new_search_range, new_search_matches, new_scrollbar, hyperlink_hints);
         new_search_matches = .empty;
+
+        // Tab bar snapshot: titles, active highlight, and strip height.
+        const new_bar = try self.tabBarSnapshot();
+        defer self.freeTabBarSnapshot(new_bar);
+        tab_bar_dirty = self.async_job.tab_bar_height != self.tab_bar_height or
+            !tabBarEqual(self.async_job.tab_bar, new_bar);
+        if (tab_bar_dirty) try self.async_job.replaceTabBar(self.alloc, new_bar, self.tab_bar_height);
         var kitty_changed = false;
         if (has_kitty_graphics) {
             // Text-only scrolling also dirties the kitty storage. It can
             // change pixels only when placements exist (or were removed).
-            kitty_changed = self.term.screens.active.kitty_images.dirty;
-            const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.term);
+            kitty_changed = self.tab().term.screens.active.kitty_images.dirty;
+            const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.tab().term);
             if (!Renderer.kittyItemsEqual(self.async_job.kitty, items)) kitty_changed = true;
-            try self.async_job.replaceKitty(self.alloc, &self.kitty_cache, items);
+            try self.async_job.replaceKitty(self.alloc, &self.tab().kitty_cache, items);
         } else {
             if (self.async_job.kitty.len > 0) kitty_changed = true;
-            self.async_job.releaseKitty(self.alloc, &self.kitty_cache);
+            self.async_job.releaseKitty(self.alloc);
         }
-        self.kitty_cache.sweep(self.alloc);
         // Kitty placements are not tracked per row, so any change to
         // the graphics — or any content change underneath them — is a
         // full render.
@@ -5912,7 +6836,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         // identical to the last one. A moving cursor trail is exempt:
         // it must keep a frame callback outstanding so it never freezes
         // mid-settle (its integer-rounded corner is momentarily stable).
-        if (self.render_state.dirty == .false and !overlay_dirty and !self.geometry_redraw and !self.cursor_anim_moving) return .no_work;
+        if (self.render_state.dirty == .false and !overlay_dirty and !tab_bar_dirty and !self.geometry_redraw and !self.cursor_anim_moving) return .no_work;
     } else {
         // Keep link affordances consistent with the stale snapshot.
         hyperlink_hints = self.async_job.hyperlink_hints;
@@ -5981,6 +6905,15 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         .search = self.async_job.search,
         .search_no_match = self.async_job.search_no_match,
         .scrollbar = if (frozen) null else self.async_job.scrollbar,
+        .tab_bar = self.async_job.tab_bar,
+        .tab_bar_height = self.tab_bar_height,
+        .tab_bar_position = self.config.tab_bar_position,
+        .tab_bar_background = self.config.effectiveTabBarBackground(self.color_scheme),
+        .active_tab_background = self.config.effectiveActiveTabBackground(self.color_scheme),
+        .active_tab_foreground = self.config.effectiveActiveTabForeground(self.color_scheme),
+        .inactive_tab_background = self.config.effectiveInactiveTabBackground(self.color_scheme),
+        .inactive_tab_foreground = self.config.effectiveInactiveTabForeground(self.color_scheme),
+        .tab_bar_dirty = tab_bar_dirty,
         .kitty_items = self.async_job.kitty,
         .cursor_overlay = self.async_job.cursor_overlay,
         .overlay_dirty = overlay_dirty,
@@ -5988,11 +6921,11 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         .repair = repair,
     }) catch |err| {
         self.window.cancelRender(target.buffer);
-        self.kitty_cache.sweep(self.alloc);
+        if (self.async_job.kitty_cache) |cache| cache.sweep(self.alloc);
         self.rasterFatal(err);
         return .deferred;
     };
-    if (!frozen) self.term.screens.active.kitty_images.dirty = false;
+    if (!frozen) self.tab().term.screens.active.kitty_images.dirty = false;
     if (!frozen) self.async_force_full = false;
     return .submitted;
 }
@@ -6000,7 +6933,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
 fn tickKittyAnimations(self: *App) void {
     const now_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
     const now_ms: u64 = @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
-    const delay_ms = self.term.screens.active.kitty_images.animationTick(self.io, now_ms);
+    const delay_ms = self.tab().term.screens.active.kitty_images.animationTick(self.io, now_ms);
     const spec: std.os.linux.itimerspec = if (delay_ms) |delay| .{
         .it_value = timespecFromNs(@max(delay, 1) *| std.time.ns_per_ms),
         .it_interval = .{ .sec = 0, .nsec = 0 },
@@ -6027,7 +6960,7 @@ fn hasContentRedraw(self: *App) bool {
     if (!self.needs_redraw) return false;
     // DEC 2026 freezes content frames, but geometry changes still
     // repaint (the frozen snapshot at the new size).
-    if (self.term.modes.get(.synchronized_output) and !self.geometry_redraw) return false;
+    if (self.tab().term.modes.get(.synchronized_output) and !self.geometry_redraw) return false;
     if (self.window.width == 0 or self.window.suspended) return false;
     if (self.window.rendering_pending) return false;
     if (self.async_raster == null) return false;
@@ -6170,8 +7103,7 @@ fn finishAsyncRender(self: *App) void {
     };
     if (result.err) |err| {
         self.window.cancelRender(buffer);
-        self.async_job.releaseKitty(self.alloc, &self.kitty_cache);
-        self.kitty_cache.sweep(self.alloc);
+        self.async_job.releaseKitty(self.alloc);
         // A deterministic raster error would retry forever; with no other
         // renderer to fall back to, stop.
         self.rasterFatal(err);
@@ -6497,44 +7429,35 @@ fn resize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
 }
 
 fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror!void {
+    self.tab_bar_height = self.font.cell_height;
+    const padding = paddingWithTabBar(config, self.window.scale120, self.tab_bar_height);
     const layout = TerminalLayout.init(
         width,
         height,
         self.font.cell_width,
         self.font.cell_height,
-        physicalPadding(config, self.window.scale120),
+        padding,
     );
     const layout_changed = !std.meta.eql(layout, self.layout);
     self.layout = layout;
     const cols = layout.columns;
     const rows = layout.rows;
-    const grid_width_px = layout.grid_width;
-    const grid_height_px = layout.grid_height;
     const terminal_width_px = std.math.mul(u32, cols, self.font.cell_width) catch std.math.maxInt(u32);
     const terminal_height_px = std.math.mul(u32, rows, self.font.cell_height) catch std.math.maxInt(u32);
-    const pixels_changed = terminal_width_px != self.term.width_px or terminal_height_px != self.term.height_px;
-    const cells_changed = cols != self.term.cols or rows != self.term.rows;
+    const pixels_changed = terminal_width_px != self.tab().term.width_px or terminal_height_px != self.tab().term.height_px;
+    const cells_changed = cols != self.tab().term.cols or rows != self.tab().term.rows;
     if (!cells_changed and !pixels_changed and !layout_changed) return;
 
     if (cells_changed or pixels_changed) {
         if (cells_changed) log.debug("resize to {d}x{d} cells", .{ cols, rows });
-        try self.term.resize(self.alloc, .{
-            .cols = cols,
-            .rows = rows,
-            .cell_size_px = .{
-                .width = self.font.cell_width,
-                .height = self.font.cell_height,
-            },
-        });
-        if (cells_changed) self.refreshSearch();
+        // Every tab shares the window geometry; keep each terminal (and, via
+        // SIGWINCH, its child) sized to the same grid.
+        for (self.tabs.items) |tb| {
+            try tb.resize(self.alloc, cols, rows, self.font.cell_width, self.font.cell_height);
+            self.notifyTabResize(tb);
+        }
+        if (cells_changed) self.refreshSearch(self.tab());
     }
-    try self.pty.setWinsize(.{
-        .row = rows,
-        .col = cols,
-        .xpixel = @intCast(grid_width_px),
-        .ypixel = @intCast(grid_height_px),
-    });
-    if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
     self.geometry_redraw = true;
     self.needs_redraw = true;
     self.syncScrollbarHover();

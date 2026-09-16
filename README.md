@@ -112,7 +112,8 @@ custom themes in `$XDG_CONFIG_HOME/monstar/themes` or
 `~/.config/monstar/themes`.
 
 Set the default command for new windows. Commands run through `/bin/sh -c`
-unless prefixed with `direct:`:
+unless prefixed with `direct:`. Simple invocations of supported shells are
+also run directly so automatic shell integration can be enabled:
 
 ```conf
 command = fish --login
@@ -131,6 +132,10 @@ Other settings:
   `0` disables the protocol (default `320000000`).
 - **inertial-scrolling** — Whether finger scrolling continues with inertial
   motion after release (default `true`).
+- **new-window-mode** — How `Ctrl+Shift+N` opens a new session: `tab` (default)
+  starts a tab in the current window; `window` spawns an independent window.
+- **tab-bar-position** — Which edge of the window holds the tab bar: `bottom`
+  (default) or `top`.
 - **copy-highlight-duration** — Post-copy selection flash in milliseconds;
   `0` disables the flash (default `200`).
 - **keybind** — Repeatable Ghostty-style `trigger=action` bindings for line
@@ -144,7 +149,7 @@ Other settings:
 - **palette** — Override one palette entry by index `0`–`255`; repeat the key
   for more entries.
 
-Press `Ctrl+Shift+,` or send `SIGUSR1` to reload the configuration:
+Press `Ctrl+Shift+F5` or send `SIGUSR1` to reload the configuration:
 
 ```sh
 pkill -USR1 monstar
@@ -190,13 +195,18 @@ and other actions are not yet supported. Search mode retains its own controls.
 | --- | --- |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
 | `Ctrl+Shift+F` | Search scrollback |
-| `Ctrl+Shift+N` | Open a new window in the current directory |
-| `Ctrl+Shift+,` | Reload configuration |
+| `Ctrl+Shift+N` | Open a new session (tab or window, per `new-window-mode`) |
+| `Ctrl+Shift+T` | Open a new tab |
+| `Ctrl+Shift+W` / `Ctrl+Shift+Q` | Close the active tab |
+| `Ctrl+Shift+H` / `Ctrl+Shift+L` | Previous / next tab |
+| `Ctrl+Shift+,` / `Ctrl+Shift+.` | Move the active tab backward / forward |
+| `Ctrl+Shift+F5` | Reload configuration |
 | `Shift+Up` / `Shift+Down` | Scroll up / down one line |
 | `Shift+PageUp` / `Shift+PageDown` | Scroll back / forward one page |
 | `Shift+Home` / `Shift+End` | Scroll to the top / bottom of scrollback |
 | `Ctrl++` / `Ctrl+=` / `Ctrl+-` | Adjust the font size |
 | `Ctrl+0` | Reset the font size |
+| Left click on a tab | Switch to that tab |
 | `Ctrl` + left click | Open a hyperlink or detected URI |
 | `Ctrl` + right click | Copy a hyperlink or detected URI |
 | `Ctrl` + drag | Make a rectangular selection |
@@ -220,9 +230,9 @@ state. Middle-click to paste the primary selection.
   opening uses Wayland activation tokens.
 - D-Bus session services provide desktop notifications and launcher progress.
   Notification actions can activate the terminal window.
-- Monstar launches new windows opened with `Ctrl+Shift+N` through the systemd
-  user manager. Optional transient scopes place each shell process tree in a
-  separate scope.
+- Monstar launches new windows opened with `Ctrl+Shift+N` when
+  `new-window-mode = window` through the systemd user manager. Optional
+  transient scopes place each shell process tree in a separate scope.
 - Wayland protocols provide fractional scaling, text-input-v3 IME, cursor
   shapes, clipboard and primary selection, server-side decorations, named app
   icons, activation, system bell, and translucent background blur support.

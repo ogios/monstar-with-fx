@@ -64,6 +64,22 @@ pub const Job = struct {
     search_no_match: bool,
     /// Transient right-edge scrollback indicator in full-surface pixels.
     scrollbar: ?Renderer.ScrollbarThumb,
+    /// Tab-bar strip labels; non-null when a tab bar is shown. The strip
+    /// occupies `tab_bar_height` pixels along the configured edge.
+    tab_bar: ?[]const Renderer.TabBarItem,
+    /// Vertical extent of the tab-bar strip in pixels.
+    tab_bar_height: u31,
+    /// Which edge of the surface the strip occupies.
+    tab_bar_position: Config.TabBarPosition = .bottom,
+    /// Tab-bar colors. Kept separate from the selection colors so a
+    /// selection change or post-copy flash never restyles the tabs.
+    tab_bar_background: vt.color.RGB = .{ .r = 0, .g = 0, .b = 0 },
+    active_tab_background: vt.color.RGB = .{ .r = 0x55, .g = 0x55, .b = 0x55 },
+    active_tab_foreground: vt.color.RGB = .{ .r = 0xff, .g = 0xff, .b = 0xff },
+    inactive_tab_background: vt.color.RGB = .{ .r = 0x3a, .g = 0x3a, .b = 0x3a },
+    inactive_tab_foreground: vt.color.RGB = .{ .r = 0xb4, .g = 0xb4, .b = 0xb4 },
+    /// Labels or active-tab styling changed independently of grid overlays.
+    tab_bar_dirty: bool = false,
     /// Visible kitty placements, resolved on the main thread with image
     /// data repointed at cache-pinned copies; empty when no graphics are
     /// visible.
@@ -87,7 +103,6 @@ pub const Job = struct {
         return self.preedit != null or self.link_hint != null or
             self.search != null or self.search_matches.len > 0 or
             self.scrollbar != null or
-            self.cursor_overlay != null or
             self.kitty_items.len > 0;
     }
 };
@@ -226,6 +241,9 @@ pub const Loader = struct {
 alloc: std.mem.Allocator,
 font: *Font,
 renderer: Renderer,
+/// Origin for converting the last job's grid damage to surface coordinates.
+rendered_grid_origin: [2]u31 = .{ 0, 0 },
+tab_bar_damage: ?Renderer.PixelRect = null,
 thread: ?std.Thread,
 mutex: std.atomic.Mutex = .unlocked,
 job_fd: posix.fd_t,
@@ -401,16 +419,23 @@ pub fn takeResult(self: *AsyncRaster) ?Result {
     return result;
 }
 
-/// Copies the most recently rendered rectangles into caller-owned `dest`,
+/// Copies the most recently rendered surface rectangles into caller-owned `dest`,
 /// clearing its previous contents while retaining capacity. Requires an idle
 /// raster, normally immediately after `takeResult`; `alloc` is used only if
 /// `dest` must grow.
-pub fn copyRenderedRects(self: *AsyncRaster, alloc: std.mem.Allocator, dest: *std.ArrayList(Renderer.PixelRect)) !void {
+pub fn copySurfaceDamageRects(self: *AsyncRaster, alloc: std.mem.Allocator, dest: *std.ArrayList(Renderer.PixelRect)) !void {
     self.lock();
     defer self.mutex.unlock();
     std.debug.assert(!self.has_job and !self.working and self.result == null);
     dest.clearRetainingCapacity();
-    try dest.appendSlice(alloc, self.renderer.rendered_rects.items);
+    // Keep tab-strip damage before grid rows.
+    if (self.tab_bar_damage) |rect| try dest.append(alloc, rect);
+    for (self.renderer.rendered_rects.items) |rect| {
+        var surface_rect = rect;
+        surface_rect.x += self.rendered_grid_origin[0];
+        surface_rect.y += self.rendered_grid_origin[1];
+        try dest.append(alloc, surface_rect);
+    }
 }
 
 fn lock(self: *AsyncRaster) void {
@@ -480,8 +505,6 @@ fn workerMain(self: *AsyncRaster) void {
         self.renderer.search_matches = job.search_matches;
         self.renderer.search_bg = job.search_background;
         self.renderer.search_fg = job.search_foreground;
-        self.renderer.cursor_overlay = job.cursor_overlay;
-        self.renderer.buffer_stride = job.width;
         var damage: Damage = .full;
         const maybe_err: ?anyerror = if (self.renderJob(job, &damage)) |_| null else |e| e;
 
@@ -494,23 +517,60 @@ fn workerMain(self: *AsyncRaster) void {
 }
 
 fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
+    self.rendered_grid_origin = .{ job.grid_x, job.grid_y };
+    self.tab_bar_damage = null;
+    self.renderer.rendered_rects.clearRetainingCapacity();
+    self.renderer.cursor_overlay = job.cursor_overlay;
+    self.renderer.buffer_stride = job.width;
+    try self.renderGrid(job, damage);
+    if (damage.* != .full and !job.tab_bar_dirty) return;
+
+    // Reserve only the padding on the strip's edge; the layout keeps the grid
+    // clear of it, but a tiny surface can shrink the strip to fit.
+    const reserved = switch (job.tab_bar_position) {
+        .top => job.grid_y,
+        .bottom => job.height -| job.grid_y -| job.grid_height,
+    };
+    const bar_height = @min(job.tab_bar_height, reserved);
+    if (bar_height == 0) return;
+    const bar_top: u31 = switch (job.tab_bar_position) {
+        .top => 0,
+        .bottom => job.height - bar_height,
+    };
+    const bar_pixels = job.pixels[@as(usize, bar_top) * job.width ..];
+    @memset(bar_pixels[0 .. @as(usize, bar_height) * job.width], self.renderer.backgroundPixel(job.tab_bar_background));
+    if (job.tab_bar) |items| {
+        // Clip glyph overhang to the strip so its damage never reaches the grid.
+        try self.renderer.renderTabBar(
+            bar_pixels,
+            job.width,
+            bar_height,
+            bar_height,
+            items,
+            job.active_tab_background,
+            job.active_tab_foreground,
+            job.inactive_tab_background,
+            job.inactive_tab_foreground,
+            job.tab_bar_background,
+        );
+    }
+    if (damage.* != .full) {
+        self.tab_bar_damage = .{ .x = 0, .y = bar_top, .width = job.width, .height = bar_height };
+        damage.* = .partial;
+    }
+}
+
+fn renderGrid(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     const grid_pixels = gridPixels(job);
-    // Most overlays draw outside the grid rows that dirty tracking accounts
-    // for, so they are always a full render with full damage. A cursor-only
-    // overlay stays inside the grid and is handled below.
+    // Include the old quad when animation ends, so the native cursor's first
+    // frame also erases the trail outside its destination row.
+    if ((job.cursor_overlay != null or self.renderer.last_cursor_quad != null) and
+        !job.hasOverlay() and self.state.dirty != .full)
+    {
+        return self.renderJobCursor(job, grid_pixels, damage);
+    }
+    // These overlays draw outside the grid rows tracked by cell damage.
     if (job.hasOverlay()) {
-        // A cursor-only overlay stays inside the grid rows, unlike the
-        // kitty/preedit/search overlays that draw into padding. A gliding
-        // cursor can therefore reuse the partial-repair path, repainting
-        // only the rows it crossed instead of the whole surface — the
-        // difference between smooth and stuttery motion while typing.
-        if (job.cursor_overlay != null and job.preedit == null and
-            job.link_hint == null and job.search == null and
-            job.search_matches.len == 0 and job.scrollbar == null and
-            job.kitty_items.len == 0 and self.state.dirty != .full)
-        {
-            return self.renderJobCursor(job, grid_pixels, damage);
-        }
         // Unless nothing changed at all: clean content plus the same
         // overlays as the previous job reproduce the previous frame,
         // so repair to it instead of re-rendering. Without this a
@@ -813,6 +873,8 @@ test "unchanged dirty rows report no damage" {
         .search = null,
         .search_no_match = false,
         .scrollbar = null,
+        .tab_bar = null,
+        .tab_bar_height = 0,
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = null,
@@ -831,6 +893,247 @@ test "unchanged dirty rows report no damage" {
 
     try std.testing.expectEqual(Damage.none, damage);
     try std.testing.expectEqual(@as(usize, 0), raster.renderer.rendered_rects.items.len);
+}
+
+test "tab bar and cursor damage match full rendering across stale buffers" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 12, .rows = 4 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25lfirst\r\nsecond\r\nthird\r\nfourth");
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    const selection: vt.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    var raster = try AsyncRaster.init(font.discovery(), selection, null, null, null, 255, false, &state);
+    defer raster.deinit();
+    var reference = try AsyncRaster.init(font.discovery(), selection, null, null, null, 255, false, &state);
+    defer reference.deinit();
+    const cw = font.cell_width;
+    const ch = font.cell_height;
+    const width = cw * 12 + 8;
+    const height = ch * 5 + 7;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const stale = try alloc.alloc(u32, pixels.len);
+    defer alloc.free(stale);
+    var job: Job = .{
+        .pixels = pixels,
+        .source_pixels = null,
+        .width = width,
+        .height = height,
+        .grid_x = 3,
+        .grid_y = ch + 3,
+        .grid_width = cw * 12,
+        .grid_height = ch * 4,
+        .age = 1,
+        .generation = 1,
+        .focused = true,
+        .hyperlink_hints = false,
+        .link_range = null,
+        .search_range = null,
+        .search_matches = &.{},
+        .search_background = selection,
+        .search_foreground = selection,
+        .preedit = null,
+        .link_hint = null,
+        .search = null,
+        .search_no_match = false,
+        .scrollbar = null,
+        .tab_bar = &.{.{ .title = "long title", .active = true }},
+        .tab_bar_height = ch,
+        .tab_bar_position = .top,
+        .kitty_items = &.{},
+        .overlay_dirty = false,
+        .scroll_shift = null,
+        .repair = .none,
+    };
+    var damage: Damage = .none;
+    try raster.renderJob(job, &damage);
+    try std.testing.expectEqual(Damage.full, damage);
+    @memcpy(stale, pixels);
+
+    // A cell edit with no animated cursor preserves the tab strip and only
+    // damages grid pixels, including the grid's nonzero surface offset.
+    clearTestDirty(&state);
+    stream.nextSlice("\x1b[2;3HX");
+    try state.update(alloc, &term);
+    try raster.renderJob(job, &damage);
+    try std.testing.expectEqual(Damage.partial, damage);
+    try std.testing.expectEqualSlices(u32, stale[0 .. @as(usize, ch) * width], pixels[0 .. @as(usize, ch) * width]);
+    var rects: std.ArrayList(Renderer.PixelRect) = .empty;
+    defer rects.deinit(alloc);
+    try raster.copySurfaceDamageRects(alloc, &rects);
+    try std.testing.expect(rects.items.len > 0);
+    for (rects.items) |rect| {
+        try std.testing.expect(rect.x >= job.grid_x);
+        try std.testing.expect(rect.y >= job.grid_y);
+    }
+    try expectFullFrame(&reference, job);
+
+    // Shortening a title clears the old suffix without rasterizing any row.
+    @memcpy(stale, pixels);
+    clearTestDirty(&state);
+    job.tab_bar = &.{.{ .title = "A", .active = false }};
+    job.tab_bar_dirty = true;
+    try raster.renderJob(job, &damage);
+    try std.testing.expectEqual(Damage.partial, damage);
+    try std.testing.expectEqual(@as(usize, 0), raster.renderer.rendered_rects.items.len);
+    try raster.copySurfaceDamageRects(alloc, &rects);
+    try std.testing.expectEqualSlices(Renderer.PixelRect, &.{.{ .x = 0, .y = 0, .width = width, .height = ch }}, rects.items);
+    try expectFullFrame(&reference, job);
+
+    // The damage ring must keep strip coordinates in surface space when a
+    // rotating shm buffer missed this title update.
+    const FrameDamageTracker = @import("FrameDamageTracker.zig");
+    var tracker: FrameDamageTracker = .init(alloc);
+    defer tracker.deinit();
+    const geometry: FrameDamageTracker.Geometry = .{
+        .width = width,
+        .height = height,
+        .grid_x = job.grid_x,
+        .grid_y = job.grid_y,
+        .grid_width = job.grid_width,
+        .grid_height = job.grid_height,
+        .cell_width = cw,
+        .cell_height = ch,
+    };
+    tracker.begin(geometry);
+    try tracker.record(&raster, damage);
+    const repair = try tracker.planRepair(2, false, geometry);
+    try std.testing.expectEqualSlices(RepairRect, rects.items, repair.rects);
+    var repair_job = job;
+    repair_job.pixels = stale;
+    repair_job.source_pixels = pixels;
+    repair_job.tab_bar_dirty = false;
+    repair_job.repair = repair;
+    try raster.renderJob(repair_job, &damage);
+    try std.testing.expectEqual(Damage.none, damage);
+    try std.testing.expectEqualSlices(u32, pixels, stale);
+
+    // A simultaneous title update and moving cursor must repaint both areas.
+    clearTestDirty(&state);
+    stream.nextSlice("\x1b[?25h\x1b[4;7H");
+    try state.update(alloc, &term);
+    job.tab_bar = &.{.{ .title = "B", .active = true }};
+    job.cursor_overlay = .{ .shape = .block, .corners = .{
+        .{ @intCast(cw), @intCast(ch) },
+        .{ @intCast(cw * 2), @intCast(ch) },
+        .{ @intCast(cw * 2), @intCast(ch * 2) },
+        .{ @intCast(cw), @intCast(ch * 2) },
+    } };
+    try raster.renderJob(job, &damage);
+    try std.testing.expectEqual(Damage.partial, damage);
+    try std.testing.expect(raster.tab_bar_damage != null);
+    try expectFullFrame(&reference, job);
+
+    // When the overlay disappears, erase its old row as well as restoring
+    // the native cursor at its destination, which is on a different row.
+    clearTestDirty(&state);
+    state.row_data.items(.dirty)[3] = true;
+    state.dirty = .partial;
+    job.cursor_overlay = null;
+    job.tab_bar_dirty = false;
+    try raster.renderJob(job, &damage);
+    try std.testing.expectEqual(Damage.partial, damage);
+    try std.testing.expect(raster.renderer.last_cursor_quad == null);
+    try expectFullFrame(&reference, job);
+}
+
+test "tab bar renders along the bottom edge" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 12, .rows = 4 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    const selection: vt.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    var raster = try AsyncRaster.init(font.discovery(), selection, null, null, null, 255, false, &state);
+    defer raster.deinit();
+    var reference = try AsyncRaster.init(font.discovery(), selection, null, null, null, 255, false, &state);
+    defer reference.deinit();
+    const cw = font.cell_width;
+    const ch = font.cell_height;
+    const width = cw * 12 + 8;
+    const height = ch * 5 + 7;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    var job: Job = .{
+        .pixels = pixels,
+        .source_pixels = null,
+        .width = width,
+        .height = height,
+        .grid_x = 3,
+        .grid_y = 3,
+        .grid_width = cw * 12,
+        .grid_height = ch * 4,
+        .age = 1,
+        .generation = 1,
+        .focused = true,
+        .hyperlink_hints = false,
+        .link_range = null,
+        .search_range = null,
+        .search_matches = &.{},
+        .search_background = selection,
+        .search_foreground = selection,
+        .preedit = null,
+        .link_hint = null,
+        .search = null,
+        .search_no_match = false,
+        .scrollbar = null,
+        .tab_bar = &.{.{ .title = "long title", .active = true }},
+        .tab_bar_height = ch,
+        .tab_bar_position = .bottom,
+        .kitty_items = &.{},
+        .overlay_dirty = false,
+        .scroll_shift = null,
+        .repair = .none,
+    };
+    var damage: Damage = .none;
+    try raster.renderJob(job, &damage);
+    try std.testing.expectEqual(Damage.full, damage);
+    try expectFullFrame(&reference, job);
+
+    // A title update repaints only the bottom strip, in surface coordinates.
+    clearTestDirty(&state);
+    job.tab_bar = &.{.{ .title = "A", .active = false }};
+    job.tab_bar_dirty = true;
+    try raster.renderJob(job, &damage);
+    try std.testing.expectEqual(Damage.partial, damage);
+    var rects: std.ArrayList(Renderer.PixelRect) = .empty;
+    defer rects.deinit(alloc);
+    try raster.copySurfaceDamageRects(alloc, &rects);
+    const bar_top: u31 = height - ch;
+    try std.testing.expectEqualSlices(Renderer.PixelRect, &.{.{ .x = 0, .y = bar_top, .width = width, .height = ch }}, rects.items);
+    try expectFullFrame(&reference, job);
+}
+
+fn clearTestDirty(state: *vt.RenderState) void {
+    for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+    state.dirty = .false;
+}
+
+fn expectFullFrame(reference: *AsyncRaster, job: Job) !void {
+    const pixels = try std.testing.allocator.alloc(u32, job.pixels.len);
+    defer std.testing.allocator.free(pixels);
+    var full_job = job;
+    full_job.pixels = pixels;
+    full_job.source_pixels = null;
+    full_job.repair = .none;
+    const previous_dirty = reference.state.dirty;
+    defer reference.state.dirty = previous_dirty;
+    reference.state.dirty = .full;
+    var damage: Damage = .none;
+    try reference.renderJob(full_job, &damage);
+    try std.testing.expectEqual(Damage.full, damage);
+    try std.testing.expectEqualSlices(u32, pixels, job.pixels);
 }
 
 test "primary and alternate screen scroll pixels match full repaint" {
@@ -884,6 +1187,8 @@ test "primary and alternate screen scroll pixels match full repaint" {
                         .search = null,
                         .search_no_match = false,
                         .scrollbar = null,
+                        .tab_bar = null,
+                        .tab_bar_height = 0,
                         .kitty_items = &.{},
                         .overlay_dirty = false,
                         .scroll_shift = null,
@@ -945,6 +1250,8 @@ test "repair previous frame" {
         .search = null,
         .search_no_match = false,
         .scrollbar = null,
+        .tab_bar = null,
+        .tab_bar_height = 0,
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = null,
@@ -1017,6 +1324,8 @@ test "scroll previous frame in place and from distinct source" {
         .search = null,
         .search_no_match = false,
         .scrollbar = null,
+        .tab_bar = null,
+        .tab_bar_height = 0,
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = 1,

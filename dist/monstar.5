@@ -69,7 +69,9 @@ Set the child command used when no command is supplied on the command line.
 An unprefixed value, or one prefixed with
 .BR shell: ,
 is passed to
-.BR /bin/sh " " \-c .
+.BR /bin/sh " " \-c ,
+except for simple invocations of supported shells, which are executed directly
+so automatic shell integration can be enabled.
 A value prefixed with
 .B direct:
 is split on spaces and tabs and executed directly; shell quoting is not
@@ -164,6 +166,11 @@ The default is zero.
 Set minimum top and bottom padding in logical pixels.
 One value applies to both sides; two values set top and bottom independently.
 The default is zero.
+.TP
+.BI tab-bar-position " = top|bottom"
+Place the tab bar on the given edge of the window.
+The default is
+.BR bottom .
 .SH STORAGE AND INPUT SETTINGS
 .TP
 .BI copy-highlight-duration " = milliseconds"
@@ -304,6 +311,16 @@ An explicit color in the main configuration overrides the named theme.
 Runtime OSC color changes may override terminal, cursor, and selection colors
 until they are reset by the application.
 .TP
+.BI active-tab-background " = color"
+Set the background of the active tab.
+When unset, a color is derived from the terminal background and foreground:
+the active tab sits visibly nearer the foreground, so it reads as raised above
+the tab bar without borrowing the selection color.
+.TP
+.BI active-tab-foreground " = color"
+Set the title color of the active tab.
+When unset, the terminal foreground is used.
+.TP
 .BI background " = color"
 Set the default terminal background.
 Built-in defaults are
@@ -358,6 +375,15 @@ in light mode and
 .B #ffffff
 in dark mode.
 .TP
+.BI inactive-tab-background " = color"
+Set the background of inactive tabs.
+When unset, a color is derived from the terminal background and foreground:
+the inactive tab sits only slightly off the tab bar.
+.TP
+.BI inactive-tab-foreground " = color"
+Set the title color of inactive tabs.
+When unset, the terminal foreground is blended partway toward the background.
+.TP
 .BI palette " = index=color"
 Override one terminal palette entry.
 The index must be between 0 and 255 and may use decimal or a
@@ -383,19 +409,34 @@ Built-in defaults are
 in light mode and
 .B #ffffff
 in dark mode.
+.TP
+.BI tab-bar-background " = color"
+Set the background of the tab bar strip.
+When unset, the terminal background is used.
+.PP
+The tab colors are independent of the selection colors, so selecting text or
+the post-copy flash never restyles the tabs.
+Tabs fade into the bar background over four whole cells at each edge, using
+the same discrete steps as kitty's default
+.BR tab_fade .
 .SH THEME FILES
 Theme files use the same line syntax as the main configuration but accept only
 these color keys:
+.BR active-tab-background ,
+.BR active-tab-foreground ,
 .BR background ,
 .BR copy-highlight ,
 .BR copy-highlight-foreground ,
 .BR cursor-color ,
 .BR cursor-text ,
 .BR foreground ,
+.BR inactive-tab-background ,
+.BR inactive-tab-foreground ,
 .BR palette ,
 .BR selection-background ,
+.BR selection-foreground ,
 and
-.BR selection-foreground .
+.BR tab-bar-background .
 The
 .B palette
 key may be repeated.

@@ -29,6 +29,9 @@ const kitty_placeholder = vt.kitty.graphics.unicode.placeholder;
 const search_match_alpha = 128;
 /// Foreground weight for faint (SGR 2) text; the rest blends to background.
 const faint_alpha = 128;
+/// Per-cell fade weights for each tab edge, from the outermost cell inward.
+/// These are the 8-bit forms of kitty's `tab_fade` default `0.25 0.5 0.75 1`.
+const tab_fade_alphas = [_]u8{ 0x40, 0x80, 0xbf, 0xff };
 
 pub const ScrollbarThumb = pixel_raster.ScrollbarThumb;
 pub const KittyRenderItem = kitty_graphics.KittyRenderItem;
@@ -1008,6 +1011,302 @@ fn renderTextOverlay(
             }
         }
         x += span;
+    }
+}
+
+/// One tab rendered in the tab bar strip.
+pub const TabBarItem = struct {
+    title: []const u8,
+    active: bool,
+};
+
+/// Returns the tab box under the physical x coordinate, or null when the
+/// coordinate falls in unused space at the end of the strip. Uses the same
+/// adaptive title allocation as renderTabBar.
+pub fn tabBarItemAt(
+    alloc: std.mem.Allocator,
+    items: []const TabBarItem,
+    width: u31,
+    cell_width: u31,
+    x: u31,
+) !?usize {
+    if (items.len == 0 or width == 0 or cell_width == 0 or x >= width) return null;
+
+    const desired = try alloc.alloc(u31, items.len);
+    defer alloc.free(desired);
+    const budgets = try alloc.alloc(u31, items.len);
+    defer alloc.free(budgets);
+    var codepoints: std.ArrayList(u21) = .empty;
+    defer codepoints.deinit(alloc);
+
+    const max_fade_cells: u31 = @intCast(tab_fade_alphas.len);
+    var active_idx: usize = 0;
+    for (items, 0..) |item, i| {
+        codepoints.clearRetainingCapacity();
+        var it = (try std.unicode.Utf8View.init(item.title)).iterator();
+        while (it.nextCodepoint()) |cp| try codepoints.append(alloc, cp);
+        desired[i] = overlayText(codepoints.items, std.math.maxInt(u31), false).width +| 2 * max_fade_cells;
+        if (item.active) active_idx = i;
+    }
+    tabTitleBudgets(desired, budgets, width / cell_width, active_idx);
+
+    var x0: u31 = 0;
+    for (budgets, 0..) |budget, i| {
+        const box_width = tabBoxWidth(width, cell_width, x0, budget) orelse break;
+        if (x < x0 + box_width) return i;
+        x0 += box_width;
+    }
+    return null;
+}
+
+/// Draw the tab bar into `pixels`, which holds the strip alone. `bar_height`
+/// is the vertical extent of the strip (in pixels); the caller positions it
+/// on the configured edge. Each tab is a colored box with its title; the
+/// active tab uses
+/// `active_bg`/`active_fg` and the inactive tabs `inactive_bg`/`inactive_fg`.
+///
+/// Each tab edge fades into the bar background over a run of whole cells,
+/// one discrete blend step per cell (kitty's `tab_fade` style), so the gap
+/// between neighbors reads as a stepped valley rather than a smooth ramp.
+/// The runs are symmetric; on narrow tabs they drop steps rather than
+/// overlapping the title.
+///
+/// Titles are truncated with an ellipsis when the strip cannot show every
+/// tab in full. Space is shared evenly, tabs narrower than their share
+/// return the leftover, and the active tab (then any still-oversized tabs)
+/// receives it, mirroring kitty's adaptive tab title truncation.
+pub fn renderTabBar(
+    self: *Renderer,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    bar_height: u31,
+    items: []const TabBarItem,
+    active_bg: vt.color.RGB,
+    active_fg: vt.color.RGB,
+    inactive_bg: vt.color.RGB,
+    inactive_fg: vt.color.RGB,
+    bg: vt.color.RGB,
+) !void {
+    if (bar_height == 0 or width == 0 or items.len == 0) return;
+    if (height < bar_height) return;
+    const cell_w = self.font.cell_width;
+    const cell_h = self.font.cell_height;
+    if (cell_w == 0) return;
+    const box_h: u31 = @min(bar_height, @max(1, cell_h));
+    const pad_x: u31 = cell_w / 2;
+    const max_fade_cells: u31 = @intCast(tab_fade_alphas.len);
+
+    // Measure each title's full width in cells. The allocation target also
+    // includes the fade cells: they are tab chrome, not title capacity.
+    const title_widths = try self.alloc.alloc(u31, items.len);
+    defer self.alloc.free(title_widths);
+    const desired = try self.alloc.alloc(u31, items.len);
+    defer self.alloc.free(desired);
+    const budgets = try self.alloc.alloc(u31, items.len);
+    defer self.alloc.free(budgets);
+    var active_idx: usize = 0;
+    for (items, 0..) |item, i| {
+        const cps = try self.overlayCodepoints(item.title);
+        title_widths[i] = overlayText(cps, std.math.maxInt(u31), false).width;
+        desired[i] = title_widths[i] +| 2 * max_fade_cells;
+        if (item.active) active_idx = i;
+    }
+    tabTitleBudgets(desired, budgets, width / cell_w, active_idx);
+
+    var x0: u31 = 0;
+    for (items, 0..) |item, i| {
+        const box_w = tabBoxWidth(width, cell_w, x0, budgets[i]) orelse break;
+        const box_cells = box_w / cell_w;
+        const budget = box_cells - 1;
+
+        // Whole-cell fade runs consume title cells; a narrow tab drops steps
+        // instead of overlapping the title.
+        const fade_cells: u31 = @min(max_fade_cells, (box_cells - 1) / 2);
+        const title_cells: u31 = budget - 2 * fade_cells;
+
+        const is_active = item.active;
+        const box_bg = if (is_active) active_bg else inactive_bg;
+        const box_fg = if (is_active) active_fg else inactive_fg;
+        fillRect(
+            pixels,
+            self.pixelStride(width),
+            width,
+            height,
+            x0,
+            0,
+            box_w,
+            box_h,
+            argb(box_bg),
+        );
+        // Kitty-style fade: one discrete blend step per whole cell, from the
+        // outermost cell inward. The innermost step is the full tab color.
+        var step: u31 = 0;
+        while (step < fade_cells) : (step += 1) {
+            const color = argb(blendRgb(box_bg, bg, tab_fade_alphas[step]));
+            fillRect(pixels, self.pixelStride(width), width, height, x0 + step * cell_w, 0, cell_w, box_h, color);
+            fillRect(pixels, self.pixelStride(width), width, height, x0 + box_w - (step + 1) * cell_w, 0, cell_w, box_h, color);
+        }
+        if (is_active and box_h > 1) {
+            // A thin accent line under the active tab, inside the fades.
+            const accent_w = box_w - 2 * fade_cells * cell_w;
+            fillRect(
+                pixels,
+                self.pixelStride(width),
+                width,
+                height,
+                x0 + fade_cells * cell_w,
+                box_h -| 2,
+                accent_w,
+                2,
+                argb(active_fg),
+            );
+        }
+
+        // Title text, vertically centered, elided with an ellipsis if needed.
+        if (cell_h > 0 and title_cells > 0) {
+            const baseline_y: i32 = @divTrunc(@as(i32, box_h), 2) + self.font.baseline - @divTrunc(@as(i32, cell_h), 2);
+            const tx = x0 + fade_cells * cell_w + pad_x;
+            const cps = try self.overlayCodepoints(item.title);
+            if (title_widths[i] <= title_cells) {
+                try self.drawTabClusters(pixels, width, height, cps, title_cells, tx, baseline_y, box_fg);
+            } else {
+                const visible = overlayText(cps, title_cells - 1, false);
+                try self.drawTabClusters(pixels, width, height, cps, visible.width, tx, baseline_y, box_fg);
+                const ellipsis = [_]u21{'…'};
+                try self.drawTabClusters(pixels, width, height, &ellipsis, 1, tx + visible.width * cell_w, baseline_y, box_fg);
+            }
+        }
+        x0 += box_w;
+    }
+}
+
+/// Width of one rendered tab box after clipping its allocated title budget to
+/// the remaining strip. Kept shared by rendering and pointer hit testing.
+fn tabBoxWidth(width: u31, cell_width: u31, x0: u31, allocated_budget: u31) ?u31 {
+    const remaining = width -| x0;
+    if (remaining < cell_width) return null;
+
+    var budget = allocated_budget;
+    const fit_cells: u31 = if (remaining > cell_width) remaining / cell_width - 1 else 0;
+    if (budget > fit_cells) budget = fit_cells;
+    const box_width = (budget + 1) * cell_width;
+    if (box_width > remaining) return null;
+    return box_width;
+}
+
+/// Assign each tab a non-padding cell budget. Space is split evenly, tabs
+/// narrower than their share return the leftover, and the active tab (then
+/// any remaining oversized tabs) split it. `desired` includes the title and
+/// edge fades; `budgets` receives the possibly reduced width per tab.
+fn tabTitleBudgets(desired: []const u31, budgets: []u31, total_cells: u31, active_idx: usize) void {
+    std.debug.assert(desired.len == budgets.len);
+    const n: u32 = @intCast(desired.len);
+    if (n == 0) return;
+    std.debug.assert(active_idx < desired.len);
+
+    const reserved: u32 = n; // one padding cell per tab
+    const total: u32 = total_cells;
+    const text_total: u32 = if (total > reserved) total - reserved else 0;
+    const default_budget: u31 = @intCast(text_total / n);
+
+    var extra: u32 = 0;
+    for (desired, 0..) |w, i| {
+        if (w < default_budget) {
+            budgets[i] = w;
+            extra += @as(u32, default_budget) - w;
+        } else {
+            budgets[i] = default_budget;
+        }
+    }
+    if (extra == 0) return;
+
+    // Active tab gets first claim on the leftover.
+    if (desired[active_idx] > budgets[active_idx]) {
+        const d: u32 = @min(extra, @as(u32, desired[active_idx]) - budgets[active_idx]);
+        budgets[active_idx] += @intCast(d);
+        extra -= d;
+    }
+    if (extra == 0) return;
+
+    // Split what remains among tabs whose titles still overflow.
+    var over: u32 = 0;
+    for (desired, 0..) |w, i| {
+        if (w > budgets[i]) over += 1;
+    }
+    if (over == 0) return;
+    const amt: u32 = extra / over;
+    if (amt == 0) return;
+    for (desired, 0..) |w, i| {
+        if (w > budgets[i]) {
+            const room: u32 = @as(u32, w) - budgets[i];
+            budgets[i] += @intCast(@min(amt, room));
+        }
+    }
+}
+
+/// Draw up to `max_cells` columns of `cps` starting at `start_x`, splitting
+/// on grapheme boundaries so a wide cluster is never half-drawn.
+fn drawTabClusters(
+    self: *Renderer,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    cps: []const u21,
+    max_cells: u31,
+    start_x: u31,
+    baseline_y: i32,
+    fg: vt.color.RGB,
+) !void {
+    var tx = start_x;
+    var drawn: u31 = 0;
+    var i: usize = 0;
+    while (i < cps.len) {
+        const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
+        if (cluster.len == 0) break;
+        const cp = cps[i];
+        i += cluster.len;
+        const span: u31 = cluster.width;
+        if (span == 0) continue;
+        if (drawn + span > max_cells) break;
+        try self.blitTabCluster(pixels, width, height, cp, span, tx, baseline_y, fg);
+        tx += span * self.font.cell_width;
+        drawn += span;
+    }
+}
+
+fn blitTabCluster(
+    self: *Renderer,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    cp: u21,
+    span: u31,
+    x_px: u31,
+    baseline_y: i32,
+    fg: vt.color.RGB,
+) !void {
+    const face_idx = self.font.faceForCodepoint(self.alloc, cp);
+    const glyph = if (face_idx == Font.sprite_face_index)
+        try self.font.spriteGlyph(self.alloc, cp, @intCast(@min(span, 2)))
+    else glyph: {
+        const face = self.font.face(face_idx);
+        const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+        break :glyph if (glyph_idx == 0) null else try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+    };
+    if (glyph) |g| {
+        blitGlyph(
+            pixels,
+            self.pixelStride(width),
+            width,
+            height,
+            g,
+            @as(i32, x_px) + @as(i32, g.bearing_x),
+            baseline_y - @as(i32, g.bearing_y),
+            argb(fg),
+            false,
+            self.glyph_clip_x,
+        );
     }
 }
 
@@ -2591,6 +2890,144 @@ test "scrollback viewport scrolls and renders older content" {
     // Scrolling back to active restores the bottom.
     pages.scroll(.active);
     try std.testing.expect(pages.viewport == .active);
+}
+
+test "tab titles render sprite glyphs" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    const width = font.cell_width * 4;
+    const height = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const black: vt.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+    const white: vt.color.RGB = .{ .r = 255, .g = 255, .b = 255 };
+    @memset(pixels, argb(black));
+    try renderer.renderTabBar(pixels, width, height, height, &.{.{ .title = "─", .active = false }}, black, white, black, white, black);
+    var ink = false;
+    for (pixels) |pixel| ink = ink or pixel != argb(black);
+    try std.testing.expect(ink);
+}
+
+test "tab title is not elided when the full title and fades fit" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    const fade_cells: u31 = @intCast(tab_fade_alphas.len);
+    const width: u31 = font.cell_width * (4 + 2 * fade_cells + 1);
+    const height = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const black: vt.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+    const white: vt.color.RGB = .{ .r = 255, .g = 255, .b = 255 };
+    @memset(pixels, argb(black));
+
+    try renderer.renderTabBar(pixels, width, height, height, &.{.{ .title = "abcd", .active = false }}, black, white, black, white, black);
+
+    var title_ink = false;
+    for (pixels) |pixel| title_ink = title_ink or pixel != argb(black);
+    try std.testing.expect(title_ink);
+}
+
+test "tab title budgets elide long titles and favor the active tab" {
+    var budgets: [4]u31 = undefined;
+    {
+        const ideal = [_]u31{ 3, 20, 40, 5 };
+        tabTitleBudgets(&ideal, &budgets, 20, 2);
+        try std.testing.expectEqualSlices(u31, &.{ 3, 4, 5, 4 }, &budgets);
+    }
+    {
+        const ideal = [_]u31{ 2, 2, 40, 40 };
+        tabTitleBudgets(&ideal, &budgets, 30, 0);
+        try std.testing.expectEqualSlices(u31, &.{ 2, 2, 10, 10 }, &budgets);
+    }
+}
+
+test "tab bar hit testing matches adaptive box allocation" {
+    const items = [_]TabBarItem{
+        .{ .title = "a", .active = false },
+        .{ .title = "bbbbbbbb", .active = true },
+    };
+    const cell_width: u31 = 10;
+    const width: u31 = 20 * cell_width;
+
+    try std.testing.expectEqual(@as(?usize, 0), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 0));
+    try std.testing.expectEqual(@as(?usize, 0), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 99));
+    try std.testing.expectEqual(@as(?usize, 1), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 100));
+    try std.testing.expectEqual(@as(?usize, 1), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 199));
+    try std.testing.expectEqual(@as(?usize, null), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 200));
+}
+
+test "tab bar hit testing leaves unused tail unclaimed" {
+    const items = [_]TabBarItem{
+        .{ .title = "long first title", .active = true },
+        .{ .title = "long second title", .active = false },
+        .{ .title = "long third title", .active = false },
+    };
+    const cell_width: u31 = 10;
+    const width: u31 = 8 * cell_width;
+
+    try std.testing.expectEqual(@as(?usize, 2), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 59));
+    try std.testing.expectEqual(@as(?usize, null), try tabBarItemAt(std.testing.allocator, &items, width, cell_width, 60));
+}
+
+test "narrow tab bar elides titles but still draws the active tab" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    const width = font.cell_width * 8;
+    const height = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const black: vt.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+    const white: vt.color.RGB = .{ .r = 255, .g = 255, .b = 255 };
+    const red: vt.color.RGB = .{ .r = 255, .g = 0, .b = 0 };
+    const green: vt.color.RGB = .{ .r = 0, .g = 255, .b = 0 };
+    @memset(pixels, argb(black));
+    const items = [_]TabBarItem{
+        .{ .title = "a very long first tab title", .active = false },
+        .{ .title = "another quite long title", .active = false },
+        .{ .title = "the active tab with a long title", .active = true },
+    };
+    try renderer.renderTabBar(pixels, width, height, height, &items, red, green, black, white, black);
+    var active_box = false;
+    for (pixels) |pixel| active_box = active_box or pixel == argb(red);
+    try std.testing.expect(active_box);
+}
+
+test "tab bar fades tabs into the bar background in discrete cell steps" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    const cw = font.cell_width;
+    const width = cw * 20;
+    const height = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const black: vt.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+    const white: vt.color.RGB = .{ .r = 255, .g = 255, .b = 255 };
+    @memset(pixels, argb(black));
+    const items = [_]TabBarItem{
+        .{ .title = "aaaaaaaa", .active = false },
+        .{ .title = "bbbbbbbb", .active = false },
+    };
+    try renderer.renderTabBar(pixels, width, height, height, &items, white, black, white, black, black);
+
+    // The first tab's leading cells step from the bar background toward the
+    // tab color one whole cell at a time.
+    try std.testing.expectEqual(argb(blendRgb(white, black, tab_fade_alphas[0])), pixels[0]);
+    try std.testing.expectEqual(argb(blendRgb(white, black, tab_fade_alphas[1])), pixels[cw]);
+    try std.testing.expectEqual(argb(blendRgb(white, black, tab_fade_alphas[2])), pixels[2 * cw]);
+    // The innermost step is the full inactive tab color.
+    try std.testing.expectEqual(argb(white), pixels[3 * cw]);
 }
 
 test "preedit renders sprite glyphs alongside font glyphs" {

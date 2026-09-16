@@ -64,6 +64,11 @@ pub const ThemeOverrides = struct {
     selection_foreground: ?vt.color.RGB = null,
     copy_highlight: ?vt.color.RGB = null,
     copy_highlight_foreground: ?vt.color.RGB = null,
+    tab_bar_background: ?vt.color.RGB = null,
+    active_tab_background: ?vt.color.RGB = null,
+    active_tab_foreground: ?vt.color.RGB = null,
+    inactive_tab_background: ?vt.color.RGB = null,
+    inactive_tab_foreground: ?vt.color.RGB = null,
     palette: [256]?vt.color.RGB = @splat(null),
 };
 
@@ -302,6 +307,31 @@ pub fn parseOverrides(text: []const u8) ThemeOverrides {
                 warn("theme line {d}: invalid copy-highlight-foreground", .{line_no});
                 continue;
             };
+        } else if (std.mem.eql(u8, key, "tab-bar-background")) {
+            result.tab_bar_background = parseColor(value) catch {
+                warn("theme line {d}: invalid tab-bar-background", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "active-tab-background")) {
+            result.active_tab_background = parseColor(value) catch {
+                warn("theme line {d}: invalid active-tab-background", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "active-tab-foreground")) {
+            result.active_tab_foreground = parseColor(value) catch {
+                warn("theme line {d}: invalid active-tab-foreground", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "inactive-tab-background")) {
+            result.inactive_tab_background = parseColor(value) catch {
+                warn("theme line {d}: invalid inactive-tab-background", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "inactive-tab-foreground")) {
+            result.inactive_tab_foreground = parseColor(value) catch {
+                warn("theme line {d}: invalid inactive-tab-foreground", .{line_no});
+                continue;
+            };
         } else if (std.mem.eql(u8, key, "palette")) {
             const entry = parsePaletteEntry(value) catch {
                 warn("theme line {d}: invalid palette", .{line_no});
@@ -324,6 +354,18 @@ pub fn colorsForScheme(color_scheme: vt.device_status.ColorScheme) ThemeColors {
 
 pub fn resolveColor(explicit: ?vt.color.RGB, named: ?vt.color.RGB, built_in: vt.color.RGB) vt.color.RGB {
     return explicit orelse named orelse built_in;
+}
+
+/// Linear blend of two colors. `alpha` is the weight of `fg`: 0 yields `bg`
+/// and 255 yields `fg`.
+pub fn blend(fg: vt.color.RGB, bg: vt.color.RGB, alpha: u8) vt.color.RGB {
+    const a: u32 = alpha;
+    const na: u32 = 255 - a;
+    return .{
+        .r = @intCast((@as(u32, fg.r) * a + @as(u32, bg.r) * na) / 255),
+        .g = @intCast((@as(u32, fg.g) * a + @as(u32, bg.g) * na) / 255),
+        .b = @intCast((@as(u32, fg.b) * a + @as(u32, bg.b) * na) / 255),
+    };
 }
 
 pub fn resolveTerminalColor(

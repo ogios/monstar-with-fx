@@ -35,7 +35,7 @@ pub const Geometry = struct {
 const FrameDamage = struct {
     /// Everything changed (or rendering failed partway); ignore `rects`.
     full: bool,
-    /// Physical buffer rectangles changed by Renderer.renderDirty.
+    /// Physical surface rectangles changed by grid or tab-bar rendering.
     rects: std.ArrayList(Renderer.PixelRect),
     /// Pixel geometry this entry was recorded at.
     geometry: Geometry,
@@ -86,12 +86,8 @@ pub fn record(self: *FrameDamageTracker, async_raster: *AsyncRaster, rendered: A
     switch (rendered) {
         .full => unreachable,
         .partial => {
-            try async_raster.copyRenderedRects(self.alloc, &damage.rects);
+            try async_raster.copySurfaceDamageRects(self.alloc, &damage.rects);
             std.debug.assert(damage.rects.items.len > 0);
-            for (damage.rects.items) |*rect| {
-                rect.x += damage.geometry.grid_x;
-                rect.y += damage.geometry.grid_y;
-            }
             coalesceDamageRects(&damage.rects);
         },
         .none => {},
