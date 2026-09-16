@@ -166,6 +166,11 @@ pub fn underline_dashed(
     }
 }
 
+// Wu antialiased undercurl, ported from kitty (decorations.c
+// add_curl_underline, MIT/GPL3). Each x column paints two antialias
+// boundary intensites plus a solid fill, so the wiggle reads as bold
+// instead of a hairline. Amplitude is derived from the descender space
+// rather than the cell width, matching kitty's taller, more visible wave.
 pub fn underline_curly(
     cp: u32,
     canvas: *sprite.Canvas,
@@ -175,65 +180,65 @@ pub fn underline_curly(
 ) !void {
     _ = cp;
 
-    var ctx = canvas.getContext();
-    defer ctx.deinit();
+    const max_x: f64 = @floatFromInt(width -| 1);
+    const max_y: u32 = height -| 1;
+    const xfactor: f64 = 2.0 * std.math.pi / max_x;
 
-    const float_width: f64 = @floatFromInt(width);
-    const float_height: f64 = @floatFromInt(height);
-    const float_pos: f64 = @floatFromInt(metrics.underline_position);
+    const d_quot: u32 = metrics.underline_thickness / 2;
+    const d_rem: u32 = metrics.underline_thickness % 2;
+    const pos_limit: u32 = if (height > d_quot + d_rem) height - (d_quot + d_rem) else 0;
+    var position: u32 = @min(metrics.underline_position, pos_limit);
 
-    // Because of we way we draw the undercurl, we end up making it around 1px
-    // thicker than it should be, to fix this we just reduce the thickness by 1.
-    //
-    // We use a minimum thickness of 0.414 because this empirically produces
-    // the nicest undercurls at 1px underline thickness; thinner tends to look
-    // too thin compared to straight underlines and has artefacting.
-    ctx.line_width = @floatFromInt(metrics.underline_thickness);
+    const thick_cap: u32 = if (height > position + 1) height - (position + 1) else 0;
+    var thickness: u32 = @max(1, @min(metrics.underline_thickness, thick_cap));
 
-    // Rounded caps, adjacent underlines will have these overlap and so not be
-    // visible, but it makes the ends look cleaner.
-    ctx.line_cap_mode = .round;
+    const max_height: u32 = if (position > thickness / 2) height - (position - thickness / 2) else height;
+    const half_height: u32 = @max(1, max_height / 4);
 
-    // Empirically this looks good.
-    const amplitude = float_width / std.math.pi;
+    // The curve's Wu-aliased bounding edges supply part of the visual
+    // thickness, so the solid fill is one row thinner than the nominal.
+    thickness = @max(1, thickness) - (if (thickness < 3) @as(u32, 1) else @as(u32, 2));
 
-    // Make sure we don't exceed the drawable area. This can still be outside
-    // of the cell by some amount (one quarter of the height), but we don't
-    // want underlines to disappear for fonts with bad metadata or when users
-    // set their underline position way too low.
-    const padding: f64 = @floatFromInt(canvas.padding_y);
-    const top: f64 = @min(
-        float_pos,
-        // The lowest we can draw this and not get clipped.
-        float_height + padding - amplitude - ctx.line_width,
-    );
-    const bottom = top + amplitude;
+    position += half_height * 2;
+    if (position + half_height > max_y) position = max_y -| half_height;
 
-    // Curvature multiplier.
-    // To my eye, 0.4 creates a nice smooth wiggle.
-    const r = 0.4;
+    const sfc_width: u32 = @intCast(canvas.sfc.getWidth());
+    const fill: f64 = @floatFromInt(thickness);
 
-    const center = 0.5 * float_width;
+    for (0..width) |x| {
+        const y: f64 = @as(f64, @floatFromInt(half_height)) * std.math.cos(@as(f64, @floatFromInt(x)) * xfactor);
+        const y_floor: f64 = @floor(y);
+        const y1: i32 = @intFromFloat(@floor(y - fill));
+        const y2: i32 = @intFromFloat(@ceil(y));
+        const intensity: u8 = @intFromFloat(@floor(255.0 * @abs(y - y_floor)));
+        const xc: i32 = @intCast(x);
 
-    // We create a single cycle of a wave that peaks at the center of the cell.
-    try ctx.moveTo(0, bottom);
-    try ctx.curveTo(
-        center * r,
-        bottom,
-        center - center * r,
-        top,
-        center,
-        top,
-    );
-    try ctx.curveTo(
-        center + center * r,
-        top,
-        float_width - center * r,
-        bottom,
-        float_width,
-        bottom,
-    );
-    try ctx.stroke();
+        curlAlpha(canvas, xc, y1, 255 - intensity, sfc_width, max_y, position);
+        curlAlpha(canvas, xc, y2, intensity, sfc_width, max_y, position);
+        var t: u32 = 1;
+        while (t <= thickness) : (t += 1) {
+            curlAlpha(canvas, xc, y1 + @as(i32, @intCast(t)), 255, sfc_width, max_y, position);
+        }
+    }
+}
+
+/// Saturating write of `val` alpha at canvas column `x`, row `position+y`,
+/// clamped into the cell. Accumulates so overlapping dots stay solid.
+fn curlAlpha(
+    canvas: *sprite.Canvas,
+    x: i32,
+    y: i32,
+    val: u8,
+    sfc_width: u32,
+    max_y: u32,
+    position: u32,
+) void {
+    const yy: i32 = std.math.clamp(y + @as(i32, @intCast(position)), 0, @as(i32, @intCast(max_y)));
+    const bx: i32 = x + @as(i32, @intCast(canvas.padding_x));
+    const by: i32 = yy + @as(i32, @intCast(canvas.padding_y));
+    const idx: usize = @as(usize, @intCast(by)) * sfc_width + @as(usize, @intCast(bx));
+    const buf = std.mem.sliceAsBytes(canvas.sfc.image_surface_alpha8.buf);
+    if (idx < buf.len) buf[idx] +|= val;
 }
 
 pub fn strikethrough(

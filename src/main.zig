@@ -11,6 +11,7 @@ const Font = @import("Font.zig");
 const Link = @import("Link.zig");
 const Pty = @import("Pty.zig");
 const Renderer = @import("Renderer.zig");
+const ShellIntegration = @import("ShellIntegration.zig");
 const TerminalLayout = @import("TerminalLayout.zig");
 const Window = @import("Window.zig");
 
@@ -261,6 +262,7 @@ fn invalidCli(init: std.process.Init) noreturn {
 
 /// GUI mode: run a live terminal session in a window.
 fn gui(init: std.process.Init, cli: CliOptions) !void {
+    raiseFdLimit();
     const arena = init.arena.allocator();
 
     var config = if (cli.config_path) |path|
@@ -273,8 +275,16 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
     try config.resolveThemes(init.io, arena, init.minimal.environ);
     const working_directory = try resolveWorkingDirectory(arena, init.minimal.environ, config.working_directory);
 
-    const command = try buildCommand(arena, config, init.minimal.environ, cli.command_mode, cli.command, working_directory);
-    const envp = try buildEnvp(init.io, arena, init.minimal.environ);
+    var command = try buildCommand(arena, config, init.minimal.environ, cli.command_mode, cli.command, working_directory);
+
+    var env_map = std.process.Environ.Map.init(arena);
+    try env_map.putPosixBlock(init.minimal.environ.block.view());
+    if (ShellIntegration.resourcesDir(init.io, arena, init.minimal.environ)) |resources| {
+        if (try ShellIntegration.setup(arena, init.io, resources, command, &env_map)) |integrated| {
+            command = integrated.command;
+        }
+    }
+    const envp = try buildEnvp(init.io, arena, &env_map);
 
     const app = try App.init(
         init.io,
@@ -296,6 +306,18 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
     defer app.deinit();
     app.window.initial_activation_token = init.minimal.environ.getPosix("XDG_ACTIVATION_TOKEN");
     try app.run();
+}
+
+/// Raise the soft open-file limit to the hard limit. Every tab holds a PTY
+/// master and slave plus pipeline fds, and login managers commonly hand out a
+/// soft limit of 1024, which only a few dozen tabs exhaust; the hard limit is
+/// usually far larger and is the ceiling we may raise to without privileges.
+fn raiseFdLimit() void {
+    const limits = std.posix.getrlimit(.NOFILE) catch return;
+    if (limits.cur >= limits.max) return;
+    std.posix.setrlimit(.NOFILE, .{ .cur = limits.max, .max = limits.max }) catch |err| {
+        log.warn("could not raise open-file limit to {d}: {}", .{ limits.max, err });
+    };
 }
 
 /// Command-line sizes take precedence; the configured grid size applies only
@@ -329,10 +351,7 @@ fn resolveWorkingDirectory(
     return path;
 }
 
-const ChildCommand = struct {
-    path: [*:0]const u8,
-    argv: [:null]const ?[*:0]const u8,
-};
+const ChildCommand = ShellIntegration.Command;
 
 fn buildCommand(
     arena: std.mem.Allocator,
@@ -355,6 +374,7 @@ fn buildCommand(
         },
     } else if (config.command) |configured| switch (configured) {
         .shell => |value| {
+            if (try buildSimpleShellCommand(arena, environ, value, cwd)) |simple| return simple;
             path = "/bin/sh";
             try argv.appendSlice(arena, &.{ "/bin/sh", "-c", value.ptr });
         },
@@ -369,6 +389,100 @@ fn buildCommand(
         try argv.append(arena, shell.ptr);
     }
     return .{ .path = path, .argv = try argv.toOwnedSliceSentinel(arena, null) };
+}
+
+/// Promote a simple supported-shell invocation to direct execution so shell
+/// integration can identify and prepare it. Expressions using shell syntax
+/// retain their documented `/bin/sh -c` behavior.
+fn buildSimpleShellCommand(
+    arena: std.mem.Allocator,
+    environ: std.process.Environ,
+    command: []const u8,
+    cwd: ?[:0]const u8,
+) !?ChildCommand {
+    const parsed = (try parseSimpleCommand(arena, command)) orelse return null;
+    if (ShellIntegration.detectShellPath(parsed[0]) == null) return null;
+
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    for (parsed) |arg| try argv.append(arena, arg.ptr);
+
+    return .{
+        .path = try App.resolveCommandPath(arena, environ, parsed[0], cwd),
+        .argv = try argv.toOwnedSliceSentinel(arena, null),
+    };
+}
+
+/// Split one command into argv while rejecting operators and expansions whose
+/// meaning would change without `/bin/sh`. Quoting is accepted so shell paths
+/// and arguments may contain spaces.
+fn parseSimpleCommand(arena: std.mem.Allocator, command: []const u8) !?[]const [:0]const u8 {
+    const Quote = enum { none, single, double };
+    var quote: Quote = .none;
+    var word: std.ArrayList(u8) = .empty;
+    var args: std.ArrayList([:0]const u8) = .empty;
+    var word_started = false;
+    var i: usize = 0;
+
+    while (i < command.len) : (i += 1) {
+        const char = command[i];
+        switch (quote) {
+            .none => switch (char) {
+                ' ', '\t' => {
+                    if (word_started) {
+                        try args.append(arena, try arena.dupeZ(u8, word.items));
+                        word.clearRetainingCapacity();
+                        word_started = false;
+                    }
+                },
+                '\'' => {
+                    quote = .single;
+                    word_started = true;
+                },
+                '"' => {
+                    quote = .double;
+                    word_started = true;
+                },
+                '\\' => {
+                    i += 1;
+                    if (i == command.len or command[i] == '\n') return null;
+                    try word.append(arena, command[i]);
+                    word_started = true;
+                },
+                '$', '`', '|', '&', ';', '(', ')', '<', '>', '\n', '\r', '*', '?', '[', '{', '}', '~', '#' => return null,
+                else => {
+                    try word.append(arena, char);
+                    word_started = true;
+                },
+            },
+            .single => {
+                if (char == '\'') {
+                    quote = .none;
+                } else {
+                    try word.append(arena, char);
+                }
+            },
+            .double => switch (char) {
+                '"' => quote = .none,
+                '$', '`', '\n', '\r' => return null,
+                '\\' => {
+                    if (i + 1 == command.len) return null;
+                    const next = command[i + 1];
+                    if (next == '$' or next == '`') return null;
+                    if (next == '"' or next == '\\') {
+                        i += 1;
+                        try word.append(arena, next);
+                    } else {
+                        try word.append(arena, char);
+                    }
+                },
+                else => try word.append(arena, char),
+            },
+        }
+    }
+    if (quote != .none) return null;
+    if (word_started) try args.append(arena, try arena.dupeZ(u8, word.items));
+    if (args.items.len == 0) return null;
+    return try args.toOwnedSlice(arena);
 }
 
 fn validateWorkingDirectory(path: [:0]const u8) !void {
@@ -389,19 +503,17 @@ fn validateWorkingDirectory(path: [:0]const u8) !void {
 fn buildEnvp(
     io: std.Io,
     arena: std.mem.Allocator,
-    environ: std.process.Environ,
+    env: *const std.process.Environ.Map,
 ) ![*:null]const ?[*:0]const u8 {
     var list: std.ArrayList(?[*:0]const u8) = .empty;
     var has_terminfo = false;
-    for (environ.block.slice) |entry| {
-        const e = entry orelse continue;
-        const value = std.mem.span(e);
-        if (std.mem.startsWith(u8, value, "TERM=")) continue;
-        if (std.mem.startsWith(u8, value, "COLORTERM=")) continue;
+    for (env.keys(), env.values()) |key, value| {
+        if (std.mem.eql(u8, key, "TERM")) continue;
+        if (std.mem.eql(u8, key, "COLORTERM")) continue;
         // The launcher token belongs to our window, not the shell or its children.
-        if (std.mem.startsWith(u8, value, "XDG_ACTIVATION_TOKEN=")) continue;
-        if (std.mem.startsWith(u8, value, "TERMINFO=")) has_terminfo = true;
-        try list.append(arena, e);
+        if (std.mem.eql(u8, key, "XDG_ACTIVATION_TOKEN")) continue;
+        if (std.mem.eql(u8, key, "TERMINFO")) has_terminfo = true;
+        try list.append(arena, try std.fmt.allocPrintSentinel(arena, "{s}={s}", .{ key, value }, 0));
     }
     try list.append(arena, "TERM=monstar");
     try list.append(arena, "COLORTERM=truecolor");
@@ -430,7 +542,9 @@ test "shell environment excludes the launch activation token" {
         "KEEP=value",
     };
     const environ: std.process.Environ = .{ .block = .{ .slice = &envp } };
-    const child = try buildEnvp(std.testing.io, arena_state.allocator(), environ);
+    var env_map = std.process.Environ.Map.init(arena_state.allocator());
+    try env_map.putPosixBlock(environ.block.view());
+    const child = try buildEnvp(std.testing.io, arena_state.allocator(), &env_map);
     const expected = [_][]const u8{
         "TERMINFO=/custom/terminfo",
         "KEEP=value",
@@ -474,6 +588,8 @@ test {
     _ = Renderer;
     _ = @import("ScrollbackSearch.zig");
     _ = @import("ScrollDetector.zig");
+    _ = @import("ShellIntegration.zig");
+    _ = @import("Tab.zig");
     _ = @import("pixel_copy.zig");
     _ = @import("pixel_raster.zig");
     _ = @import("sprite.zig");
@@ -594,6 +710,53 @@ test "configured shell command runs through sh" {
     try std.testing.expectEqualStrings("/bin/sh", std.mem.span(command.argv[0].?));
     try std.testing.expectEqualStrings("-c", std.mem.span(command.argv[1].?));
     try std.testing.expectEqualStrings("printf '%s' hello", std.mem.span(command.argv[2].?));
+}
+
+test "configured supported shell command runs directly for integration" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const command = try buildCommand(
+        arena_state.allocator(),
+        .{ .command = .{ .shell = "bash --login" } },
+        .empty,
+        .shell,
+        &.{},
+        null,
+    );
+    try std.testing.expectEqualStrings("bash", std.fs.path.basename(std.mem.span(command.path)));
+    try std.testing.expectEqualStrings("bash", std.mem.span(command.argv[0].?));
+    try std.testing.expectEqualStrings("--login", std.mem.span(command.argv[1].?));
+}
+
+test "configured supported shell command preserves quoted arguments" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const command = try buildCommand(
+        arena_state.allocator(),
+        .{ .command = .{ .shell = "bash --rcfile '/tmp/monstar rc'" } },
+        .empty,
+        .shell,
+        &.{},
+        null,
+    );
+    try std.testing.expectEqualStrings("bash", std.fs.path.basename(std.mem.span(command.path)));
+    try std.testing.expectEqualStrings("--rcfile", std.mem.span(command.argv[1].?));
+    try std.testing.expectEqualStrings("/tmp/monstar rc", std.mem.span(command.argv[2].?));
+}
+
+test "configured shell expression beginning with a supported shell keeps sh wrapper" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const command = try buildCommand(
+        arena_state.allocator(),
+        .{ .command = .{ .shell = "bash && echo ready" } },
+        .empty,
+        .shell,
+        &.{},
+        null,
+    );
+    try std.testing.expectEqualStrings("/bin/sh", std.mem.span(command.path));
+    try std.testing.expectEqualStrings("bash && echo ready", std.mem.span(command.argv[2].?));
 }
 
 test "configured direct command preserves arguments" {

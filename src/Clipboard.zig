@@ -27,10 +27,13 @@ const max_write_per_dispatch = 64 * 1024;
 
 pub const Target = enum { clipboard, primary };
 
+pub const Osc52Read = struct { tab_id: u64, kind: u8 };
+pub const TerminalPaste = struct { tab_id: u64, target: Target };
+
 pub const Purpose = union(enum) {
-    terminal: Target,
-    osc52_read: u8,
-    kitty_read,
+    terminal: TerminalPaste,
+    osc52_read: Osc52Read,
+    kitty_read: u64,
 };
 
 pub const RequestResult = enum { started, busy, unavailable };
@@ -45,12 +48,13 @@ pub const DndData = struct {
 
 pub const Event = union(enum) {
     terminal: struct {
+        tab_id: u64,
         target: Target,
         mime: []const u8,
         data: []const u8,
     },
-    osc52_read: struct { kind: u8, data: []const u8 },
-    kitty_read: struct { mime: []const u8, data: []const u8 },
+    osc52_read: struct { tab_id: u64, kind: u8, data: []const u8 },
+    kitty_read: struct { tab_id: u64, mime: []const u8, data: []const u8 },
     dnd: DndData,
 };
 
@@ -115,11 +119,12 @@ drag_fn: ?DragFn,
 
 const TransferAction = union(enum) {
     terminal: struct {
+        tab_id: u64 = 0,
         target: Target,
         mime: [*:0]const u8,
     },
-    osc52_read: struct { kind: u8, mime: [*:0]const u8 },
-    kitty_read: [*:0]const u8,
+    osc52_read: struct { tab_id: u64, kind: u8, mime: [*:0]const u8 },
+    kitty_read: struct { tab_id: u64, mime: [*:0]const u8 },
     dnd: *DataOffer,
 };
 
@@ -309,6 +314,7 @@ pub fn init(
         .transfer_fd = -1,
         .transfer_buf = .empty,
         .transfer_action = .{ .terminal = .{
+            .tab_id = 0,
             .target = .clipboard,
             .mime = clipboard_format.paste_mime_preference[0].ptr,
         } },
@@ -473,10 +479,18 @@ pub fn expireTransfers(self: *Clipboard) bool {
     return incoming_expired;
 }
 
-pub fn osc52ReadKind(self: *const Clipboard) ?u8 {
+pub fn osc52Read(self: *const Clipboard) ?Osc52Read {
     if (self.transfer_fd < 0) return null;
     return switch (self.transfer_action) {
-        .osc52_read => |read| read.kind,
+        .osc52_read => |read| .{ .tab_id = read.tab_id, .kind = read.kind },
+        else => null,
+    };
+}
+
+pub fn kittyReadTabId(self: *const Clipboard) ?u64 {
+    if (self.transfer_fd < 0) return null;
+    return switch (self.transfer_action) {
+        .kitty_read => |read| read.tab_id,
         else => null,
     };
 }
@@ -596,9 +610,9 @@ pub fn request(self: *Clipboard, target: Target, purpose: Purpose) RequestResult
             const offer = self.clip_offer orelse return .unavailable;
             const mime = offer.bestMime() orelse return .unavailable;
             const action: TransferAction = switch (purpose) {
-                .terminal => |source| .{ .terminal = .{ .target = source, .mime = mime } },
-                .osc52_read => |kind| .{ .osc52_read = .{ .kind = kind, .mime = mime } },
-                .kitty_read => .{ .kitty_read = mime },
+                .terminal => |source| .{ .terminal = .{ .tab_id = source.tab_id, .target = source.target, .mime = mime } },
+                .osc52_read => |read| .{ .osc52_read = .{ .tab_id = read.tab_id, .kind = read.kind, .mime = mime } },
+                .kitty_read => |tab_id| .{ .kitty_read = .{ .tab_id = tab_id, .mime = mime } },
             };
             self.beginTransfer(mime, .{ .clipboard = offer }, action) catch return .unavailable;
         },
@@ -606,9 +620,9 @@ pub fn request(self: *Clipboard, target: Target, purpose: Purpose) RequestResult
             const offer = self.primary_offer orelse return .unavailable;
             const mime = offer.bestMime() orelse return .unavailable;
             const action: TransferAction = switch (purpose) {
-                .terminal => |source| .{ .terminal = .{ .target = source, .mime = mime } },
-                .osc52_read => |kind| .{ .osc52_read = .{ .kind = kind, .mime = mime } },
-                .kitty_read => .{ .kitty_read = mime },
+                .terminal => |source| .{ .terminal = .{ .tab_id = source.tab_id, .target = source.target, .mime = mime } },
+                .osc52_read => |read| .{ .osc52_read = .{ .tab_id = read.tab_id, .kind = read.kind, .mime = mime } },
+                .kitty_read => |tab_id| .{ .kitty_read = .{ .tab_id = tab_id, .mime = mime } },
             };
             self.beginTransfer(mime, .{ .primary = offer }, action) catch return .unavailable;
         },
@@ -647,6 +661,7 @@ pub fn readTransfer(self: *Clipboard) !?Event {
     self.transfer_fd = -1;
     return switch (self.transfer_action) {
         .terminal => |transfer| .{ .terminal = .{
+            .tab_id = transfer.tab_id,
             .target = transfer.target,
             .mime = std.mem.span(transfer.mime),
             .data = self.transfer_buf.items,
@@ -661,10 +676,11 @@ pub fn readTransfer(self: *Clipboard) !?Event {
                 self.transfer_buf.deinit(self.alloc);
                 self.transfer_buf = .fromOwnedSlice(decoded);
             }
-            break :read .{ .osc52_read = .{ .kind = read.kind, .data = self.transfer_buf.items } };
+            break :read .{ .osc52_read = .{ .tab_id = read.tab_id, .kind = read.kind, .data = self.transfer_buf.items } };
         },
-        .kitty_read => |mime| .{ .kitty_read = .{
-            .mime = std.mem.span(mime),
+        .kitty_read => |read| .{ .kitty_read = .{
+            .tab_id = read.tab_id,
+            .mime = std.mem.span(read.mime),
             .data = self.transfer_buf.items,
         } },
         .dnd => |offer| .{ .dnd = .{
@@ -687,6 +703,7 @@ pub fn finishEvent(self: *Clipboard) void {
     }
     self.transfer_buf.clearRetainingCapacity();
     self.transfer_action = .{ .terminal = .{
+        .tab_id = 0,
         .target = .clipboard,
         .mime = clipboard_format.paste_mime_preference[0].ptr,
     } };
@@ -701,6 +718,7 @@ fn abortTransfer(self: *Clipboard) void {
     }
     self.transfer_buf.clearRetainingCapacity();
     self.transfer_action = .{ .terminal = .{
+        .tab_id = 0,
         .target = .clipboard,
         .mime = clipboard_format.paste_mime_preference[0].ptr,
     } };
@@ -1363,12 +1381,12 @@ test "incoming deadline preserves OSC 52 kind until expiry" {
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
     defer _ = linux.close(fds[1]);
     clipboard.transfer_fd = fds[0];
-    clipboard.transfer_action = .{ .osc52_read = .{ .kind = 'c', .mime = "UTF8_STRING" } };
+    clipboard.transfer_action = .{ .osc52_read = .{ .tab_id = 1, .kind = 'c', .mime = "UTF8_STRING" } };
     clipboard.transfer_deadline_ms = monotonicMs() - 1;
-    try std.testing.expectEqual(@as(?u8, 'c'), clipboard.osc52ReadKind());
+    try std.testing.expectEqual(@as(?u8, 'c'), clipboard.osc52Read().?.kind);
     try std.testing.expectEqual(@as(i32, 0), clipboard.pollTimeoutMs());
     try std.testing.expect(clipboard.expireTransfers());
-    try std.testing.expectEqual(@as(?u8, null), clipboard.osc52ReadKind());
+    try std.testing.expect(clipboard.osc52Read() == null);
 }
 
 test "OSC 52 reads normalize STRING while Kitty reads preserve MIME bytes" {
@@ -1376,9 +1394,9 @@ test "OSC 52 reads normalize STRING while Kitty reads preserve MIME bytes" {
     var clipboard: Clipboard = .init(std.testing.allocator, null, null);
     defer clipboard.deinit();
     const cases = [_]struct { action: TransferAction, data: []const u8, expected: []const u8 }{
-        .{ .action = .{ .osc52_read = .{ .kind = 'p', .mime = "STRING" } }, .data = "caf\xe9 \xc3\xa9", .expected = "café Ã©" },
-        .{ .action = .{ .osc52_read = .{ .kind = 'p', .mime = "UTF8_STRING" } }, .data = "café €", .expected = "café €" },
-        .{ .action = .{ .kitty_read = "STRING" }, .data = "caf\xe9", .expected = "caf\xe9" },
+        .{ .action = .{ .osc52_read = .{ .tab_id = 1, .kind = 'p', .mime = "STRING" } }, .data = "caf\xe9 \xc3\xa9", .expected = "café Ã©" },
+        .{ .action = .{ .osc52_read = .{ .tab_id = 1, .kind = 'p', .mime = "UTF8_STRING" } }, .data = "café €", .expected = "café €" },
+        .{ .action = .{ .kitty_read = .{ .tab_id = 1, .mime = "STRING" } }, .data = "caf\xe9", .expected = "caf\xe9" },
     };
     for (cases) |case| {
         var fds: [2]posix.fd_t = undefined;
