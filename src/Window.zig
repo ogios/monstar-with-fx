@@ -42,6 +42,10 @@ cursor_theme: ?*wl.CursorTheme,
 cursor_surface: ?*wl.Surface,
 cursor_shape: CursorShape,
 pointer_enter_serial: ?u32,
+/// Surface carrying the drag image while a drag-out is active. Created
+/// lazily and passed to wl_data_device.start_drag.
+drag_icon_surface: ?*wl.Surface,
+drag_icon_buffer: ?*ShmBuffer,
 /// Clipboard: managers create sources (copy); devices carry offers
 /// (paste) and set selections. Null when the compositor lacks them.
 data_manager: ?*wl.DataDeviceManager,
@@ -380,6 +384,8 @@ pub fn create(
         .cursor_surface = cursor_surface,
         .cursor_shape = .text,
         .pointer_enter_serial = null,
+        .drag_icon_surface = null,
+        .drag_icon_buffer = null,
         .data_manager = globals.data_manager,
         .data_device = data_device,
         .primary_manager = globals.primary_manager,
@@ -460,6 +466,8 @@ pub fn destroy(self: *Window) void {
     if (self.data_device) |device| destroyDataDevice(device);
     if (self.seat) |seat| destroySeat(seat);
     if (self.cursor_surface) |surface| surface.destroy();
+    if (self.drag_icon_buffer) |buffer| buffer.destroy(self.alloc);
+    if (self.drag_icon_surface) |surface| surface.destroy();
     if (self.cursor_theme) |theme| theme.destroy();
     if (self.cursor_shape_manager) |manager| manager.destroy();
     if (self.data_manager) |manager| {
@@ -684,6 +692,55 @@ pub fn setTextInputCursorRect(self: *Window, rect: TextInputRect) void {
     text_input.setCursorRectangle(rect.x, rect.y, rect.width, rect.height);
     text_input.commit();
     self.text_input_rect = rect;
+}
+
+/// Install or replace the image shown beside the pointer during a
+/// native drag-out. `pixels` are premultiplied ARGB8888, at least
+/// width*height entries. Returns the icon surface to hand to
+/// wl_data_device.start_drag, or null when the icon could not be built.
+pub fn setDragIcon(self: *Window, width: u31, height: u31, pixels: []const u32) ?*wl.Surface {
+    std.debug.assert(width > 0 and height > 0);
+    std.debug.assert(pixels.len >= @as(usize, width) * @as(usize, height));
+    if (self.drag_icon_surface == null) {
+        self.drag_icon_surface = self.compositor.createSurface() catch return null;
+    }
+    const surface = self.drag_icon_surface.?;
+    if (self.drag_icon_buffer) |buffer| {
+        buffer.destroy(self.alloc);
+        self.drag_icon_buffer = null;
+    }
+    const buffer = ShmBuffer.create(self.alloc, self.shm, width, height, .argb8888) catch {
+        surface.destroy();
+        self.drag_icon_surface = null;
+        return null;
+    };
+    self.drag_icon_buffer = buffer;
+    const count = @as(usize, width) * @as(usize, height);
+    @memcpy(buffer.pixels()[0..count], pixels[0..count]);
+    if (surface.getVersion() >= wl.Surface.set_buffer_scale_since_version) {
+        const scale: u32 = @max(1, (self.scale120 + 119) / 120);
+        surface.setBufferScale(@intCast(scale));
+    }
+    surface.attach(buffer.wl_buffer, 0, 0);
+    if (surface.getVersion() >= wl.Surface.damage_buffer_since_version)
+        surface.damageBuffer(0, 0, @intCast(width), @intCast(height))
+    else
+        surface.damage(0, 0, @intCast(width), @intCast(height));
+    surface.commit();
+    return surface;
+}
+
+/// The surface currently carrying the drag image, if any.
+pub fn dragIconSurface(self: *const Window) ?*wl.Surface {
+    return self.drag_icon_surface;
+}
+
+/// Release the drag icon surface and buffer. Safe when no icon exists.
+pub fn clearDragIcon(self: *Window) void {
+    if (self.drag_icon_buffer) |buffer| buffer.destroy(self.alloc);
+    self.drag_icon_buffer = null;
+    if (self.drag_icon_surface) |surface| surface.destroy();
+    self.drag_icon_surface = null;
 }
 
 fn applyCursorShape(self: *Window) void {

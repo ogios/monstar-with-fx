@@ -543,6 +543,7 @@ pub fn startDnd(
     tab_id: u64,
     serial: u32,
     origin: *wl.Surface,
+    icon: ?*wl.Surface,
     operations: DndOperations,
     items: []const DndSourceItem,
 ) bool {
@@ -611,7 +612,7 @@ pub fn startDnd(
     }
     source.setListener(*DndSource, dndSourceListener, ctx);
     self.dnd_source = ctx;
-    device.startDrag(source, origin, null, serial);
+    device.startDrag(source, origin, icon, serial);
     log.debug("OSC 72 Wayland start_drag sent tab={d} serial={d}", .{ tab_id, serial });
     return true;
 }
@@ -621,11 +622,14 @@ pub fn fulfillDndData(self: *Clipboard, tab_id: u64, index: usize, data: ?[]cons
     if (source.tab_id == tab_id) source.fulfill(index, data);
 }
 
-pub fn cancelDnd(self: *Clipboard, tab_id: u64) void {
-    const source = self.dnd_source orelse return;
-    if (source.tab_id != tab_id) return;
+/// Cancel the active drag source when it belongs to `tab_id`. Returns
+/// true when a source was cancelled.
+pub fn cancelDnd(self: *Clipboard, tab_id: u64) bool {
+    const source = self.dnd_source orelse return false;
+    if (source.tab_id != tab_id) return false;
     _ = self.reportDnd(.{ .source = .{ .finished = .{ .tab_id = tab_id, .cancelled = true } } });
     source.destroy();
+    return true;
 }
 
 /// Apply the running program's OSC 72 acceptance to the active Wayland drag.
@@ -1537,7 +1541,7 @@ test "drag source marshals MIME actions and original serial" {
     var clipboard: Clipboard = .init(std.testing.allocator, manager, null);
     defer clipboard.deinit();
     clipboard.setDevices(device, null);
-    try std.testing.expect(clipboard.startDnd(42, 1234, surface, .{ .copy = true, .move = true }, &.{
+    try std.testing.expect(clipboard.startDnd(42, 1234, surface, null, .{ .copy = true, .move = true }, &.{
         .{ .mime = "text/uri-list", .data = "file:///tmp/a\r\n" },
         .{ .mime = "text/plain", .data = null },
     }));

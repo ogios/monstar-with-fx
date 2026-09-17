@@ -35,6 +35,8 @@ const ScrollbackSearch = @import("ScrollbackSearch.zig");
 const ScrollDetector = @import("ScrollDetector.zig");
 const Tab = @import("Tab.zig");
 const TerminalLayout = @import("TerminalLayout.zig");
+const glyph_constraints = @import("glyph_constraints.zig");
+const pixel_raster = @import("pixel_raster.zig");
 const cgroup = @import("cgroup.zig");
 const DbusConnection = @import("dbus/Connection.zig");
 
@@ -810,6 +812,193 @@ fn decodePng(alloc: std.mem.Allocator, data: []const u8) vt.sys.DecodeError!vt.s
     };
 }
 
+/// A rasterized drag icon in premultiplied ARGB8888, owned by the caller.
+const DragIconPixels = struct {
+    width: u31,
+    height: u31,
+    pixels: []u32,
+};
+
+/// Rasterize the client's OSC 72 drag image and install it as the native
+/// drag icon. A missing or malformed image leaves the drag with no icon.
+fn installSourceDragIcon(self: *App, image: ?vt.kitty.dnd.DragImage) void {
+    const drag_image = image orelse {
+        self.window.clearDragIcon();
+        return;
+    };
+    const rendered = self.rasterizeDragImage(drag_image) catch |err| {
+        log.debug("OSC 72 drag image ignored: {}", .{err});
+        self.window.clearDragIcon();
+        return;
+    };
+    defer self.alloc.free(rendered.pixels);
+    _ = self.window.setDragIcon(rendered.width, rendered.height, rendered.pixels);
+}
+
+fn rasterizeDragImage(self: *App, image: vt.kitty.dnd.DragImage) !DragIconPixels {
+    return switch (image.format) {
+        .png => self.rasterizeDragPng(image.data),
+        .rgba => self.rasterizeDragRaw(image, 4),
+        .rgb => self.rasterizeDragRaw(image, 3),
+        .text => self.rasterizeDragText(image),
+    };
+}
+
+fn rasterizeDragPng(self: *App, data: []const u8) !DragIconPixels {
+    const decoded = try decodePng(self.alloc, data);
+    defer self.alloc.free(decoded.data);
+    if (decoded.width == 0 or decoded.height == 0) return error.InvalidDragImage;
+    const width: u31 = @intCast(decoded.width);
+    const height: u31 = @intCast(decoded.height);
+    const pixels = try self.alloc.alloc(u32, @as(usize, width) * height);
+    errdefer self.alloc.free(pixels);
+    for (pixels, 0..) |*pixel, i| pixel.* = premultipliedRgba(decoded.data[i * 4 ..][0..4]);
+    return .{ .width = width, .height = height, .pixels = pixels };
+}
+
+fn rasterizeDragRaw(self: *App, image: vt.kitty.dnd.DragImage, comptime channels: u32) !DragIconPixels {
+    if (image.size_x == 0 or image.size_y == 0) return error.InvalidDragImage;
+    const width: u31 = @intCast(image.size_x);
+    const height: u31 = @intCast(image.size_y);
+    const needed = std.math.mul(usize, @as(usize, width) * height, channels) catch return error.InvalidDragImage;
+    if (image.data.len < needed) return error.InvalidDragImage;
+    const pixels = try self.alloc.alloc(u32, @as(usize, width) * height);
+    errdefer self.alloc.free(pixels);
+    for (pixels, 0..) |*pixel, i| {
+        const src = image.data[i * channels ..][0..channels];
+        pixel.* = if (channels == 4)
+            premultipliedRgba(src[0..4])
+        else
+            0xff000000 | (@as(u32, src[0]) << 16) | (@as(u32, src[1]) << 8) | src[2];
+    }
+    return .{ .width = width, .height = height, .pixels = pixels };
+}
+
+fn premultipliedRgba(rgba: *const [4]u8) u32 {
+    return pixel_raster.blendPixel(0, rgba);
+}
+
+fn rasterizeDragText(self: *App, image: vt.kitty.dnd.DragImage) !DragIconPixels {
+    const numerator: u32 = if (image.size_x == 0) 1 else image.size_x;
+    const denominator: u32 = if (image.size_y == 0) 1 else image.size_y;
+    const size_px: f64 = self.font_size_px *
+        @as(f64, @floatFromInt(numerator)) /
+        @as(f64, @floatFromInt(denominator));
+    if (!(size_px >= 1.0) or size_px > 4096.0) return error.InvalidDragImage;
+
+    var temp_font: Font = undefined;
+    var owns_font = false;
+    defer if (owns_font) temp_font.deinit(self.alloc);
+    const font: *Font = if (size_px == self.font_size_px) &self.font else font: {
+        temp_font = try Font.init(self.alloc, self.config.font_family, size_px, self.config.adjust_cell_height);
+        owns_font = true;
+        break :font &temp_font;
+    };
+
+    const cps = try self.dragIconCodepoints(image.data);
+    defer self.alloc.free(cps);
+    if (cps.len == 0) return error.InvalidDragImage;
+
+    var columns: usize = 0;
+    var i: usize = 0;
+    while (i < cps.len) {
+        const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
+        if (cluster.len == 0) break;
+        columns += cluster.width;
+        i += cluster.len;
+    }
+    if (columns == 0) return error.InvalidDragImage;
+    const width: u31 = std.math.cast(u31, columns) orelse return error.InvalidDragImage;
+    const icon_width = std.math.mul(u31, width, font.cell_width) catch return error.InvalidDragImage;
+    if (icon_width == 0) return error.InvalidDragImage;
+    const height: u31 = font.cell_height;
+    const pixels = try self.alloc.alloc(u32, @as(usize, icon_width) * height);
+    errdefer self.alloc.free(pixels);
+
+    const alpha: u8 = @intCast(@min(image.opacity, 1024) * 255 / 1024);
+    @memset(pixels, if (alpha == 0)
+        0
+    else
+        pixel_raster.premultipliedArgb(self.effectiveBackground(), alpha));
+
+    const fg = pixel_raster.argb(self.effectiveForeground());
+    const baseline: i32 = @intCast(font.baseline);
+    var x: u31 = 0;
+    i = 0;
+    while (i < cps.len) {
+        const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
+        if (cluster.len == 0) break;
+        const cp = cps[i];
+        i += cluster.len;
+        const span: u31 = cluster.width;
+        if (span == 0) continue;
+        const pen_x: i32 = @as(i32, @intCast(x)) * @as(i32, @intCast(font.cell_width));
+        const face_idx = font.faceForCodepoint(self.alloc, cp);
+        if (face_idx == Font.sprite_face_index) {
+            const g = try font.spriteGlyph(self.alloc, cp, @intCast(@min(span, 2)));
+            pixel_raster.blitGlyph(
+                pixels,
+                icon_width,
+                icon_width,
+                height,
+                g,
+                pen_x + g.bearing_x,
+                baseline - g.bearing_y,
+                fg,
+                false,
+                null,
+            );
+        } else {
+            const face = font.face(face_idx);
+            const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+            if (glyph_idx != 0) {
+                const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+                pixel_raster.blitGlyph(
+                    pixels,
+                    icon_width,
+                    icon_width,
+                    height,
+                    g,
+                    pen_x + g.bearing_x,
+                    baseline - g.bearing_y,
+                    fg,
+                    false,
+                    null,
+                );
+            }
+        }
+        x += span;
+    }
+    return .{ .width = icon_width, .height = height, .pixels = pixels };
+}
+
+fn dragIconCodepoints(self: *App, text: []const u8) ![]u21 {
+    var list: std.ArrayList(u21) = .empty;
+    errdefer list.deinit(self.alloc);
+    var i: usize = 0;
+    while (i < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > text.len) break;
+        const cp = std.unicode.utf8Decode(text[i..][0..len]) catch {
+            i += 1;
+            continue;
+        };
+        i += len;
+        try list.append(self.alloc, switch (cp) {
+            '\n', '\r', '\t' => ' ',
+            else => cp,
+        });
+    }
+    return list.toOwnedSlice(self.alloc);
+}
+
+fn effectiveBackground(self: *const App) vt.color.RGB {
+    return self.tab().term.colors.background.get() orelse self.tab().term.colors.palette.current[0];
+}
+
 /// Window scale delegate: reload the font at the physical pixel size so
 /// glyphs are rasterized crisply instead of upscaled by the compositor.
 /// The window calls the resize delegate right after, re-fitting the grid
@@ -966,6 +1155,7 @@ fn effectDragAndDrop(handler: *Handler, event: vt.kitty.dnd.Event) void {
             app.clipboard.fulfillDndData(tb.id, index, null);
         },
         .source_cancel => app.cancelSourceDrag(tb),
+        .source_image => app.installSourceDragIcon(state.selectedSourceImage()),
         else => {},
     }
 }
@@ -4598,7 +4788,7 @@ fn cancelSourceDrag(self: *App, tb: *Tab) void {
             self.source_drag = null;
         }
     }
-    self.clipboard.cancelDnd(tb.id);
+    if (self.clipboard.cancelDnd(tb.id)) self.window.clearDragIcon();
 }
 
 /// Stop any in-progress drag, untracking the anchor pin on the screen
@@ -5206,7 +5396,10 @@ fn dndSourceEvent(self: *App, event: Clipboard.DndSourceEvent) bool {
             .move => .move,
         }) catch return true,
         .dropped => state.sourceDropped(&writer.writer) catch return true,
-        .finished => |finished| state.sourceFinished(self.alloc, &writer.writer, finished.cancelled) catch return true,
+        .finished => |finished| {
+            state.sourceFinished(self.alloc, &writer.writer, finished.cancelled) catch return true;
+            self.window.clearDragIcon();
+        },
         .data_request => |request| {
             if (state.sourceData(request.index)) |data| {
                 self.clipboard.fulfillDndData(tab_id, request.index, data);
@@ -5238,11 +5431,13 @@ fn startSourceDrag(self: *App, tb: *Tab, state: *vt.kitty.dnd.State) void {
         .mime = state.sourceMime(index).?,
         .data = state.sourceData(index),
     };
+    self.installSourceDragIcon(state.selectedSourceImage());
     log.debug("OSC 72 starting Wayland drag tab={d} mimes={d}", .{ tb.id, items.len });
     const started = self.clipboard.startDnd(
         tb.id,
         gesture.serial,
         self.window.surface,
+        self.window.dragIconSurface(),
         .{ .copy = offer.operations.copy, .move = offer.operations.move },
         items,
     );
@@ -5251,6 +5446,7 @@ fn startSourceDrag(self: *App, tb: *Tab, state: *vt.kitty.dnd.State) void {
     if (started) {
         if (self.source_drag) |*active| active.started = true;
     } else {
+        self.window.clearDragIcon();
         self.source_drag = null;
     }
 }
