@@ -257,6 +257,7 @@ selection_rectangle: bool,
 selection_gesture: vt.SelectionGesture,
 /// Button press currently owned by application mouse reporting.
 mouse_button: ?vt.input.MouseButton,
+source_drag: ?SourceDragGesture,
 /// Serial of the most recent input event, required to claim selections.
 last_serial: u32,
 clipboard: Clipboard,
@@ -314,6 +315,26 @@ const ScrollbarDrag = struct {
     grab_offset: f64,
     screen: vt.ScreenSet.Key,
 };
+
+const SourceDragGesture = struct {
+    tab_id: u64,
+    serial: u32,
+    time_ms: u32,
+    origin_x: f64,
+    origin_y: f64,
+    reporting: bool,
+    requested: bool = false,
+    started: bool = false,
+
+    const ReleaseAction = enum { cancel, mouse_release, selection_click };
+
+    fn releaseAction(self: SourceDragGesture) ReleaseAction {
+        if (self.requested) return .cancel;
+        return if (self.reporting) .mouse_release else .selection_click;
+    }
+};
+
+const source_drag_threshold = 8.0;
 
 const ScrollbarGeometry = struct {
     thumb: Renderer.ScrollbarThumb,
@@ -725,6 +746,7 @@ pub fn init(
         .selection_rectangle = false,
         .selection_gesture = .init,
         .mouse_button = null,
+        .source_drag = null,
         .last_serial = 0,
         .clipboard = .init(alloc, window.data_manager, window.primary_manager),
         .next_tab_id = 2,
@@ -917,15 +939,35 @@ fn effectClipboardRead(_: *Handler, read: vt.clipboard.Read) void {
 }
 
 fn effectDragAndDrop(handler: *Handler, event: vt.kitty.dnd.Event) void {
-    if (event != .acceptance) return;
     const tb = appFromHandler(handler);
+    const app = tb.app;
+    log.debug("OSC 72 event={s} tab={d}", .{ @tagName(event), tb.id });
+    if (event == .source_registration) {
+        app.cancelSourceDrag(tb);
+        return;
+    }
     const state = tb.term.kitty_dnd orelse return;
-    const accepted = state.clientAccepted() orelse return;
-    tb.app.clipboard.setDndAcceptance(switch (accepted) {
-        .none => .none,
-        .copy => .copy,
-        .move => .move,
-    });
+    switch (event) {
+        .acceptance => {
+            const accepted = state.clientAccepted() orelse return;
+            app.clipboard.setDndAcceptance(switch (accepted) {
+                .none => .none,
+                .copy => .copy,
+                .move => .move,
+            });
+        },
+        .source_start => app.startSourceDrag(tb, state),
+        .source_data => {
+            const index = state.sourceReadyIndex() orelse return;
+            app.clipboard.fulfillDndData(tb.id, index, state.sourceData(index));
+        },
+        .source_data_error => {
+            const index = state.sourceReadyIndex() orelse return;
+            app.clipboard.fulfillDndData(tb.id, index, null);
+        },
+        .source_cancel => app.cancelSourceDrag(tb),
+        else => {},
+    }
 }
 
 fn clipboardTarget(location: vt.clipboard.Location) ?Clipboard.Target {
@@ -2204,6 +2246,7 @@ fn newTab(self: *App) void {
 
 fn activateTab(self: *App, tb: *Tab) void {
     if (tb == self.active) return;
+    self.cancelSourceDrag(self.active);
     self.cancelDrag();
     self.cancelLinkPress();
     self.clearSelection();
@@ -2268,6 +2311,7 @@ fn closeTab(self: *App) void {
 fn closeTabAt(self: *App, idx: usize) void {
     std.debug.assert(idx < self.tabs.items.len);
     if (self.tabs.items.len <= 1) {
+        self.cancelSourceDrag(self.tabs.items[idx]);
         self.tabs.items[idx].hangup();
         self.window.running = false;
         return;
@@ -3720,6 +3764,10 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             }
             self.syncScrollbarHoverFromPointer();
             self.syncHoveredLink(false);
+            if (self.source_drag != null) {
+                self.updateSourceDrag();
+                return;
+            }
             if (self.selecting) {
                 self.extendSelection();
             } else if (self.mouse_button != null or self.reportingMouse()) {
@@ -3810,6 +3858,11 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
                     self.syncScrollbarHover();
                     return;
                 }
+                if (button.state == .pressed and self.armSourceDrag(button.serial, button.time, reporting)) {
+                    if (reporting) self.forwardMouseButton(button, mouse_button.?);
+                    return;
+                }
+                if (button.state == .released and self.finishSourceDragGesture()) return;
                 switch (button.state) {
                     .pressed => if (reporting) {
                         self.forwardMouseButton(button, mouse_button.?);
@@ -3859,11 +3912,116 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         // the physical direction hint does not change that behavior.
         .axis_relative_direction => {},
         .leave => {
+            if (self.source_drag) |gesture| {
+                if (!gesture.started) self.cancelSourceDrag(self.active);
+            }
             self.pointer_inside = false;
             self.syncScrollbarHover();
             self.syncHoveredLink(false);
         },
     }
+}
+
+fn sourceDragAllowed(enabled: bool, shift: bool) bool {
+    return enabled and !shift;
+}
+
+fn sourceDragThresholdExceeded(origin_x: f64, origin_y: f64, x: f64, y: f64) bool {
+    const dx = x - origin_x;
+    const dy = y - origin_y;
+    return dx * dx + dy * dy >= source_drag_threshold * source_drag_threshold;
+}
+
+fn armSourceDrag(self: *App, serial: u32, time_ms: u32, reporting: bool) bool {
+    const state = self.tab().term.kitty_dnd orelse return false;
+    if (!sourceDragAllowed(state.sourceEnabled(), self.keyboard.currentMods().shift)) return false;
+    self.source_drag = .{
+        .tab_id = self.tab().id,
+        .serial = serial,
+        .time_ms = time_ms,
+        .origin_x = self.pointer_x,
+        .origin_y = self.pointer_y,
+        .reporting = reporting,
+    };
+    log.debug("OSC 72 drag armed tab={d} serial={d} x={d:.1} y={d:.1}", .{ self.tab().id, serial, self.pointer_x, self.pointer_y });
+    return true;
+}
+
+fn updateSourceDrag(self: *App) void {
+    const gesture = if (self.source_drag) |*value| value else return;
+    if (gesture.requested) return;
+    if (!sourceDragThresholdExceeded(gesture.origin_x, gesture.origin_y, self.pointer_x, self.pointer_y)) return;
+    const tb = self.findTab(gesture.tab_id) orelse {
+        self.source_drag = null;
+        return;
+    };
+    const state = tb.term.kitty_dnd orelse {
+        self.source_drag = null;
+        return;
+    };
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    const requested = state.requestDrag(
+        &writer.writer,
+        self.kittyDndMove(gesture.origin_x, gesture.origin_y, .{}),
+    ) catch false;
+    if (!requested) {
+        self.source_drag = null;
+        return;
+    }
+    gesture.requested = true;
+    log.debug("OSC 72 drag gesture requested tab={d}", .{gesture.tab_id});
+    tb.writePty(writer.writer.buffered());
+}
+
+fn finishSourceDragGesture(self: *App) bool {
+    const gesture = self.source_drag orelse return false;
+    self.source_drag = null;
+    const tb = self.findTab(gesture.tab_id) orelse return true;
+    switch (gesture.releaseAction()) {
+        .cancel => if (tb.term.kitty_dnd) |state| state.cancelDragRequest(self.alloc),
+        .mouse_release => {},
+        .selection_click => {
+            self.startSelection(gesture.time_ms);
+            self.finishSelection();
+            self.syncScrollbarHover();
+        },
+    }
+    if (gesture.reporting) {
+        self.sendMouseEvent(.{
+            .action = .release,
+            .button = .left,
+            .mods = self.keyboard.currentMods(),
+            .pos = self.pointerPosPhysical(),
+        });
+        if (self.mouse_button == .left) self.mouse_button = null;
+        self.syncScrollbarHover();
+    }
+    return true;
+}
+
+test "drag source threshold and selection override" {
+    try std.testing.expect(!sourceDragThresholdExceeded(10, 10, 17.9, 10));
+    try std.testing.expect(sourceDragThresholdExceeded(10, 10, 18, 10));
+    try std.testing.expect(sourceDragThresholdExceeded(10, 10, 16, 16));
+    try std.testing.expect(sourceDragAllowed(true, false));
+    try std.testing.expect(!sourceDragAllowed(true, true));
+    try std.testing.expect(!sourceDragAllowed(false, false));
+    const gesture: SourceDragGesture = .{
+        .tab_id = 1,
+        .serial = 2,
+        .time_ms = 3,
+        .origin_x = 4,
+        .origin_y = 5,
+        .reporting = false,
+    };
+    try std.testing.expectEqual(SourceDragGesture.ReleaseAction.selection_click, gesture.releaseAction());
+    var reporting = gesture;
+    reporting.reporting = true;
+    try std.testing.expectEqual(SourceDragGesture.ReleaseAction.mouse_release, reporting.releaseAction());
+    var requested = gesture;
+    requested.requested = true;
+    try std.testing.expectEqual(SourceDragGesture.ReleaseAction.cancel, requested.releaseAction());
 }
 
 fn pointerSurfacePhysical(self: *const App) struct { x: f64, y: f64 } {
@@ -4433,6 +4591,16 @@ fn extendSelection(self: *App) void {
     self.syncSelectionAutoscrollTimer();
 }
 
+fn cancelSourceDrag(self: *App, tb: *Tab) void {
+    if (self.source_drag) |gesture| {
+        if (gesture.tab_id == tb.id) {
+            if (tb.term.kitty_dnd) |state| state.cancelDragRequest(self.alloc);
+            self.source_drag = null;
+        }
+    }
+    self.clipboard.cancelDnd(tb.id);
+}
+
 /// Stop any in-progress drag, untracking the anchor pin on the screen
 /// that owns it (which may no longer be the active one).
 fn cancelDrag(self: *App) void {
@@ -4992,7 +5160,12 @@ fn clipboardLocation(target: Clipboard.Target) vt.clipboard.Location {
 
 fn dndEvent(ctx: *anyopaque, event: Clipboard.DndEvent) bool {
     const self: *App = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .source => |source| return self.dndSourceEvent(source),
+        else => {},
+    }
     const state = self.tab().term.kitty_dnd orelse return false;
+    if (!state.dropRegistered()) return false;
 
     var writer: std.Io.Writer.Allocating = .init(self.alloc);
     defer writer.deinit();
@@ -5007,9 +5180,86 @@ fn dndEvent(ctx: *anyopaque, event: Clipboard.DndEvent) bool {
             ) catch return true;
         },
         .leave => state.dragLeave(self.alloc, &writer.writer) catch return true,
+        .source => unreachable,
     }
     self.tab().writePty(writer.writer.buffered());
     return true;
+}
+
+fn dndSourceEvent(self: *App, event: Clipboard.DndSourceEvent) bool {
+    const tab_id = switch (event) {
+        .target => |value| value.tab_id,
+        .action => |value| value.tab_id,
+        .dropped => |value| value,
+        .finished => |value| value.tab_id,
+        .data_request => |value| value.tab_id,
+    };
+    const tb = self.findTab(tab_id) orelse return false;
+    const state = tb.term.kitty_dnd orelse return false;
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    switch (event) {
+        .target => |target| state.sourceTarget(&writer.writer, target.index) catch return true,
+        .action => |action| state.sourceAction(&writer.writer, switch (action.action) {
+            .none => .none,
+            .copy => .copy,
+            .move => .move,
+        }) catch return true,
+        .dropped => state.sourceDropped(&writer.writer) catch return true,
+        .finished => |finished| state.sourceFinished(self.alloc, &writer.writer, finished.cancelled) catch return true,
+        .data_request => |request| {
+            if (state.sourceData(request.index)) |data| {
+                self.clipboard.fulfillDndData(tab_id, request.index, data);
+            } else if (!(state.requestSourceData(&writer.writer, request.index) catch return true)) {
+                self.clipboard.fulfillDndData(tab_id, request.index, null);
+            }
+        },
+    }
+    tb.writePty(writer.writer.buffered());
+    return true;
+}
+
+fn startSourceDrag(self: *App, tb: *Tab, state: *vt.kitty.dnd.State) void {
+    const gesture = self.source_drag orelse {
+        self.writeSourceStartResult(tb, state, false);
+        return;
+    };
+    const offer = state.sourceOffer() orelse {
+        self.writeSourceStartResult(tb, state, false);
+        return;
+    };
+    if (!gesture.requested or gesture.tab_id != tb.id) {
+        self.writeSourceStartResult(tb, state, false);
+        return;
+    }
+    var item_buf: [vt.kitty.dnd.max_source_mimes]Clipboard.DndSourceItem = undefined;
+    const items = item_buf[0..offer.mime_count];
+    for (items, 0..) |*item, index| item.* = .{
+        .mime = state.sourceMime(index).?,
+        .data = state.sourceData(index),
+    };
+    log.debug("OSC 72 starting Wayland drag tab={d} mimes={d}", .{ tb.id, items.len });
+    const started = self.clipboard.startDnd(
+        tb.id,
+        gesture.serial,
+        self.window.surface,
+        .{ .copy = offer.operations.copy, .move = offer.operations.move },
+        items,
+    );
+    log.debug("OSC 72 Wayland drag result started={}", .{started});
+    self.writeSourceStartResult(tb, state, started);
+    if (started) {
+        if (self.source_drag) |*active| active.started = true;
+    } else {
+        self.source_drag = null;
+    }
+}
+
+fn writeSourceStartResult(self: *App, tb: *Tab, state: *vt.kitty.dnd.State, started: bool) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    state.sourceStartResult(self.alloc, &writer.writer, started) catch return;
+    tb.writePty(writer.writer.buffered());
 }
 
 fn writeKittyDndDrop(

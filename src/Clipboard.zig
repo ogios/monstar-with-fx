@@ -21,6 +21,8 @@ pub const max_outgoing_transfers = 8;
 const max_outgoing_bytes = 16 * 1024 * 1024;
 const transfer_timeout_ms: i64 = 10 * 1000;
 const max_write_per_dispatch = 64 * 1024;
+const max_dnd_source_bytes = 64 * 1024 * 1024;
+const max_dnd_source_mimes = 256;
 
 pub const Target = enum { clipboard, primary };
 
@@ -67,9 +69,25 @@ pub const DndMotion = struct {
     operations: DndOperations,
 };
 
+pub const DndAction = enum { none, copy, move };
+
+pub const DndSourceItem = struct {
+    mime: []const u8,
+    data: ?[]const u8,
+};
+
+pub const DndSourceEvent = union(enum) {
+    target: struct { tab_id: u64, index: ?usize },
+    action: struct { tab_id: u64, action: DndAction },
+    dropped: u64,
+    finished: struct { tab_id: u64, cancelled: bool },
+    data_request: struct { tab_id: u64, index: usize },
+};
+
 pub const DndEvent = union(enum) {
     motion: DndMotion,
     leave,
+    source: DndSourceEvent,
 };
 
 pub const DndFn = *const fn (ctx: *anyopaque, event: DndEvent) bool;
@@ -84,6 +102,7 @@ clip_pending_offer: ?*DataOffer,
 primary_offer: ?*PrimaryOffer,
 primary_pending_offer: ?*PrimaryOffer,
 dnd_offer: ?*DataOffer,
+dnd_source: ?*DndSource,
 clip_source: ?*Source,
 primary_source: ?*Source,
 transfer_fd: posix.fd_t,
@@ -226,6 +245,117 @@ const Source = struct {
     }
 };
 
+const DndSource = struct {
+    clipboard: *Clipboard,
+    tab_id: u64,
+    source: *wl.DataSource,
+    mimes: []Mime,
+    pending: [max_outgoing_transfers]?Pending = @splat(null),
+
+    const Mime = struct {
+        name: [:0]u8,
+        data: ?[]u8,
+    };
+
+    const Pending = struct {
+        fd: posix.fd_t,
+        index: usize,
+        deadline_ms: i64,
+    };
+
+    fn destroy(self: *DndSource) void {
+        const clipboard = self.clipboard;
+        if (clipboard.dnd_source == self) clipboard.dnd_source = null;
+        for (self.pending) |pending| {
+            if (pending) |item| _ = std.os.linux.close(item.fd);
+        }
+        for (self.mimes) |mime| {
+            clipboard.alloc.free(mime.name);
+            if (mime.data) |data| clipboard.alloc.free(data);
+        }
+        clipboard.alloc.free(self.mimes);
+        self.source.destroy();
+        clipboard.alloc.destroy(self);
+    }
+
+    fn mimeIndex(self: *const DndSource, mime: [*:0]const u8) ?usize {
+        const name = std.mem.span(mime);
+        for (self.mimes, 0..) |item, index| {
+            if (std.mem.eql(u8, item.name, name)) return index;
+        }
+        return null;
+    }
+
+    fn send(self: *DndSource, mime: [*:0]const u8, fd: posix.fd_t) void {
+        const index = self.mimeIndex(mime) orelse {
+            _ = std.os.linux.close(fd);
+            return;
+        };
+        if (self.mimes[index].data) |data| {
+            self.clipboard.sendSelection(data, fd);
+            return;
+        }
+        if (self.clipboard.activeOutgoingCount() + self.pendingCount() >= max_outgoing_transfers) {
+            _ = std.os.linux.close(fd);
+            return;
+        }
+        const slot = for (&self.pending, 0..) |pending, i| {
+            if (pending == null) break i;
+        } else {
+            _ = std.os.linux.close(fd);
+            return;
+        };
+        self.pending[slot] = .{
+            .fd = fd,
+            .index = index,
+            .deadline_ms = monotonicMs() + transfer_timeout_ms,
+        };
+        if (!self.clipboard.reportDnd(.{ .source = .{ .data_request = .{
+            .tab_id = self.tab_id,
+            .index = index,
+        } } })) {
+            self.pending[slot] = null;
+            _ = std.os.linux.close(fd);
+        }
+    }
+
+    fn pendingCount(self: *const DndSource) usize {
+        var count: usize = 0;
+        for (self.pending) |pending| count += @intFromBool(pending != null);
+        return count;
+    }
+
+    fn pendingDeadline(self: *const DndSource) ?i64 {
+        var deadline: ?i64 = null;
+        for (self.pending) |pending| if (pending) |item| {
+            if (deadline == null or item.deadline_ms < deadline.?) deadline = item.deadline_ms;
+        };
+        return deadline;
+    }
+
+    fn expirePending(self: *DndSource, now: i64) void {
+        for (&self.pending) |*pending| {
+            const item = pending.* orelse continue;
+            if (item.deadline_ms > now) continue;
+            _ = std.os.linux.close(item.fd);
+            pending.* = null;
+        }
+    }
+
+    fn fulfill(self: *DndSource, index: usize, data: ?[]const u8) void {
+        for (&self.pending) |*pending| {
+            const item = pending.* orelse continue;
+            if (item.index != index) continue;
+            pending.* = null;
+            if (data) |bytes| {
+                self.clipboard.sendSelection(bytes, item.fd);
+            } else {
+                _ = std.os.linux.close(item.fd);
+            }
+        }
+    }
+};
+
 pub fn init(
     alloc: std.mem.Allocator,
     data_manager: ?*wl.DataDeviceManager,
@@ -242,6 +372,7 @@ pub fn init(
         .primary_offer = null,
         .primary_pending_offer = null,
         .dnd_offer = null,
+        .dnd_source = null,
         .clip_source = null,
         .primary_source = null,
         .transfer_fd = -1,
@@ -267,11 +398,23 @@ pub fn deinit(self: *Clipboard) void {
     if (self.primary_offer) |offer| offer.destroy();
     if (self.primary_pending_offer) |offer| offer.destroy();
     if (self.dnd_offer) |offer| offer.destroy();
+    if (self.dnd_source) |source| source.destroy();
     if (self.clip_source) |source| source.destroy();
     if (self.primary_source) |source| source.destroy();
 }
 
+fn activeOutgoingCount(self: *const Clipboard) usize {
+    var count: usize = 0;
+    for (self.outgoing) |transfer| count += @intFromBool(transfer != null);
+    return count;
+}
+
 fn sendSelection(self: *Clipboard, text: []const u8, fd: posix.fd_t) void {
+    const pending = if (self.dnd_source) |source| source.pendingCount() else 0;
+    if (self.activeOutgoingCount() + pending >= max_outgoing_transfers) {
+        _ = std.os.linux.close(fd);
+        return;
+    }
     const slot = for (&self.outgoing, 0..) |transfer, i| {
         if (transfer == null) break i;
     } else {
@@ -335,6 +478,9 @@ pub fn pollTimeoutMs(self: *const Clipboard) i32 {
     for (self.outgoing) |transfer| if (transfer) |item| {
         if (deadline == null or item.deadline_ms < deadline.?) deadline = item.deadline_ms;
     };
+    if (self.dnd_source) |source| if (source.pendingDeadline()) |pending| {
+        if (deadline == null or pending < deadline.?) deadline = pending;
+    };
     const end = deadline orelse return -1;
     return @intCast(@min(@max(end - monotonicMs(), 0), std.math.maxInt(i32)));
 }
@@ -347,6 +493,7 @@ pub fn expireTransfers(self: *Clipboard) bool {
     for (self.outgoing, 0..) |transfer, i| {
         if (transfer) |item| if (item.deadline_ms <= now) self.closeOutgoing(i);
     }
+    if (self.dnd_source) |source| source.expirePending(now);
     return incoming_expired;
 }
 
@@ -389,6 +536,96 @@ pub fn setDevices(
 pub fn setDndCallback(self: *Clipboard, ctx: *anyopaque, callback: DndFn) void {
     self.dnd_ctx = ctx;
     self.dnd_fn = callback;
+}
+
+pub fn startDnd(
+    self: *Clipboard,
+    tab_id: u64,
+    serial: u32,
+    origin: *wl.Surface,
+    operations: DndOperations,
+    items: []const DndSourceItem,
+) bool {
+    const manager = self.data_manager orelse {
+        log.debug("OSC 72 Wayland drag unavailable: no data manager", .{});
+        return false;
+    };
+    const device = self.data_device orelse {
+        log.debug("OSC 72 Wayland drag unavailable: no data device", .{});
+        return false;
+    };
+    if (self.dnd_source != null or items.len == 0 or items.len > max_dnd_source_mimes) {
+        log.debug("OSC 72 Wayland drag rejected: active={} mimes={d}", .{ self.dnd_source != null, items.len });
+        return false;
+    }
+    var mime_bytes: usize = 0;
+    var data_bytes: usize = 0;
+    for (items) |item| {
+        mime_bytes +|= item.mime.len;
+        if (item.data) |data| data_bytes +|= data.len;
+    }
+    if (mime_bytes > max_transfer_size or data_bytes > max_dnd_source_bytes) return false;
+
+    const source = manager.createDataSource() catch return false;
+    const mimes = self.alloc.alloc(DndSource.Mime, items.len) catch {
+        source.destroy();
+        return false;
+    };
+    var copied: usize = 0;
+    for (items, mimes) |item, *copy| {
+        const name = self.alloc.dupeZ(u8, item.mime) catch {
+            for (mimes[0..copied]) |done| {
+                self.alloc.free(done.name);
+                if (done.data) |data| self.alloc.free(data);
+            }
+            self.alloc.free(mimes);
+            source.destroy();
+            return false;
+        };
+        const data = if (item.data) |bytes| self.alloc.dupe(u8, bytes) catch {
+            self.alloc.free(name);
+            for (mimes[0..copied]) |done| {
+                self.alloc.free(done.name);
+                if (done.data) |owned| self.alloc.free(owned);
+            }
+            self.alloc.free(mimes);
+            source.destroy();
+            return false;
+        } else null;
+        copy.* = .{ .name = name, .data = data };
+        copied += 1;
+    }
+    const ctx = self.alloc.create(DndSource) catch {
+        for (mimes) |mime| {
+            self.alloc.free(mime.name);
+            if (mime.data) |data| self.alloc.free(data);
+        }
+        self.alloc.free(mimes);
+        source.destroy();
+        return false;
+    };
+    ctx.* = .{ .clipboard = self, .tab_id = tab_id, .source = source, .mimes = mimes };
+    for (mimes) |mime| source.offer(mime.name.ptr);
+    if (source.getVersion() >= wl.DataSource.set_actions_since_version) {
+        source.setActions(.{ .copy = operations.copy, .move = operations.move });
+    }
+    source.setListener(*DndSource, dndSourceListener, ctx);
+    self.dnd_source = ctx;
+    device.startDrag(source, origin, null, serial);
+    log.debug("OSC 72 Wayland start_drag sent tab={d} serial={d}", .{ tab_id, serial });
+    return true;
+}
+
+pub fn fulfillDndData(self: *Clipboard, tab_id: u64, index: usize, data: ?[]const u8) void {
+    const source = self.dnd_source orelse return;
+    if (source.tab_id == tab_id) source.fulfill(index, data);
+}
+
+pub fn cancelDnd(self: *Clipboard, tab_id: u64) void {
+    const source = self.dnd_source orelse return;
+    if (source.tab_id != tab_id) return;
+    _ = self.reportDnd(.{ .source = .{ .finished = .{ .tab_id = tab_id, .cancelled = true } } });
+    source.destroy();
 }
 
 /// Apply the running program's OSC 72 acceptance to the active Wayland drag.
@@ -714,6 +951,35 @@ fn dataSourceListener(_: *wl.DataSource, event: wl.DataSource.Event, ctx: *Sourc
         .send => |send| ctx.send(send.mime_type, send.fd),
         .cancelled => ctx.destroy(),
         else => {},
+    }
+}
+
+fn dndSourceListener(_: *wl.DataSource, event: wl.DataSource.Event, ctx: *DndSource) void {
+    const clipboard = ctx.clipboard;
+    switch (event) {
+        .target => |target| {
+            const index = if (target.mime_type) |mime| ctx.mimeIndex(mime) else null;
+            _ = clipboard.reportDnd(.{ .source = .{ .target = .{ .tab_id = ctx.tab_id, .index = index } } });
+        },
+        .send => |send| ctx.send(send.mime_type, send.fd),
+        .cancelled => {
+            _ = clipboard.reportDnd(.{ .source = .{ .finished = .{ .tab_id = ctx.tab_id, .cancelled = true } } });
+            ctx.destroy();
+        },
+        .dnd_drop_performed => _ = clipboard.reportDnd(.{ .source = .{ .dropped = ctx.tab_id } }),
+        .dnd_finished => {
+            _ = clipboard.reportDnd(.{ .source = .{ .finished = .{ .tab_id = ctx.tab_id, .cancelled = false } } });
+            ctx.destroy();
+        },
+        .action => |action| {
+            const selected: DndAction = if (action.dnd_action.copy)
+                .copy
+            else if (action.dnd_action.move)
+                .move
+            else
+                .none;
+            _ = clipboard.reportDnd(.{ .source = .{ .action = .{ .tab_id = ctx.tab_id, .action = selected } } });
+        },
     }
 }
 
@@ -1171,4 +1437,139 @@ test "drag acceptance never sends an unsupported Wayland preferred action" {
         try std.testing.expectEqual(case[0], actions[2]);
         try std.testing.expectEqual(case[2], actions[3]);
     }
+}
+
+test "drag source serves requested data asynchronously" {
+    const Capture = struct {
+        request: ?DndSourceEvent = null,
+
+        fn callback(ctx: *anyopaque, event: DndEvent) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .source => |source| self.request = source,
+                else => {},
+            }
+            return true;
+        }
+    };
+    const linux = std.os.linux;
+    const alloc = std.testing.allocator;
+    var clipboard: Clipboard = .init(alloc, null, null);
+    defer clipboard.deinit();
+    var capture: Capture = .{};
+    clipboard.setDndCallback(&capture, Capture.callback);
+    const name = try alloc.dupeZ(u8, "text/uri-list");
+    defer alloc.free(name);
+    const mimes = try alloc.alloc(DndSource.Mime, 1);
+    defer alloc.free(mimes);
+    mimes[0] = .{ .name = name, .data = null };
+    var source: DndSource = .{
+        .clipboard = &clipboard,
+        .tab_id = 77,
+        .source = undefined,
+        .mimes = mimes,
+    };
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &fds,
+    )));
+    defer _ = linux.close(fds[0]);
+
+    source.send(name.ptr, fds[1]);
+    const data_request = capture.request.?.data_request;
+    try std.testing.expectEqual(@as(u64, 77), data_request.tab_id);
+    try std.testing.expectEqual(@as(usize, 0), data_request.index);
+    source.fulfill(0, "file:///tmp/a\r\n");
+    var polls: [max_outgoing_transfers]posix.pollfd = undefined;
+    clipboard.pollOutgoing(&polls);
+    _ = try posix.poll(&polls, 0);
+    clipboard.dispatchOutgoing(&polls);
+    var buf: [64]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("file:///tmp/a\r\n", buf[0..n]);
+    try std.testing.expectEqual(@as(usize, 0), clipboard.outgoing_bytes);
+
+    var stalled: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &stalled,
+    )));
+    defer _ = linux.close(stalled[0]);
+    source.send(name.ptr, stalled[1]);
+    for (&source.pending) |*pending| {
+        if (pending.*) |*item| item.deadline_ms = monotonicMs() - 1;
+    }
+    clipboard.dnd_source = &source;
+    try std.testing.expect(!clipboard.expireTransfers());
+    clipboard.dnd_source = null;
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(stalled[0], &buf));
+}
+
+test "drag source marshals MIME actions and original serial" {
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &fds,
+    )));
+    defer _ = linux.close(fds[1]);
+    const display = try wl.Display.connectToFd(fds[0]);
+    defer display.disconnect();
+    const registry = try display.getRegistry();
+    defer registry.destroy();
+    const manager = try registry.bind(1, wl.DataDeviceManager, 3);
+    defer manager.destroy();
+    const device = try registry.bind(2, wl.DataDevice, 3);
+    defer device.destroy();
+    const surface = try registry.bind(3, wl.Surface, 1);
+    defer surface.destroy();
+    try std.testing.expectEqual(.SUCCESS, display.flush());
+    var buf: [1024]u8 align(4) = undefined;
+    _ = try posix.read(fds[1], &buf);
+
+    var clipboard: Clipboard = .init(std.testing.allocator, manager, null);
+    defer clipboard.deinit();
+    clipboard.setDevices(device, null);
+    try std.testing.expect(clipboard.startDnd(42, 1234, surface, .{ .copy = true, .move = true }, &.{
+        .{ .mime = "text/uri-list", .data = "file:///tmp/a\r\n" },
+        .{ .mime = "text/plain", .data = null },
+    }));
+    const source = clipboard.dnd_source.?.source;
+    try std.testing.expectEqual(.SUCCESS, display.flush());
+    const n = try posix.read(fds[1], &buf);
+    const words = std.mem.bytesAsSlice(u32, buf[0..n]);
+    var offset: usize = 0;
+    var offers: usize = 0;
+    var saw_actions = false;
+    var saw_start = false;
+    while (offset < words.len) {
+        const object_id = words[offset];
+        const header = words[offset + 1];
+        const opcode = header & 0xffff;
+        const size = header >> 16;
+        const message = words[offset .. offset + size / 4];
+        if (object_id == source.getId() and opcode == 0) offers += 1;
+        if (object_id == source.getId() and opcode == 2) {
+            try std.testing.expectEqual(@as(u32, 3), message[2]);
+            saw_actions = true;
+        }
+        if (object_id == device.getId() and opcode == 0) {
+            try std.testing.expectEqual(source.getId(), message[2]);
+            try std.testing.expectEqual(surface.getId(), message[3]);
+            try std.testing.expectEqual(@as(u32, 0), message[4]);
+            try std.testing.expectEqual(@as(u32, 1234), message[5]);
+            saw_start = true;
+        }
+        offset += size / 4;
+    }
+    try std.testing.expectEqual(@as(usize, 2), offers);
+    try std.testing.expect(saw_actions);
+    try std.testing.expect(saw_start);
 }
