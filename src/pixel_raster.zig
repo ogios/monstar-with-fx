@@ -136,6 +136,90 @@ pub fn blendCapsule(
     }
 }
 
+/// Iterate clipped horizontal spans of a convex quadrilateral. Each scanline
+/// intersects the edges at the pixel row's center.
+pub const QuadSpans = struct {
+    const Edge = struct { a: [2]f32, b: [2]f32 };
+    const Span = struct { x: u31, y: u31, width: u31 };
+
+    edges: [4]Edge,
+    width: u31,
+    y: u31,
+    y_end: u31,
+
+    pub fn init(width: u31, height: u31, corners: [4][2]i32) QuadSpans {
+        const edges = [4]Edge{
+            .{ .a = .{ @floatFromInt(corners[0][0]), @floatFromInt(corners[0][1]) }, .b = .{ @floatFromInt(corners[1][0]), @floatFromInt(corners[1][1]) } },
+            .{ .a = .{ @floatFromInt(corners[1][0]), @floatFromInt(corners[1][1]) }, .b = .{ @floatFromInt(corners[2][0]), @floatFromInt(corners[2][1]) } },
+            .{ .a = .{ @floatFromInt(corners[2][0]), @floatFromInt(corners[2][1]) }, .b = .{ @floatFromInt(corners[3][0]), @floatFromInt(corners[3][1]) } },
+            .{ .a = .{ @floatFromInt(corners[3][0]), @floatFromInt(corners[3][1]) }, .b = .{ @floatFromInt(corners[0][0]), @floatFromInt(corners[0][1]) } },
+        };
+
+        var y_min = corners[0][1];
+        var y_max = y_min;
+        for (corners[1..]) |corner| {
+            y_min = @min(y_min, corner[1]);
+            y_max = @max(y_max, corner[1]);
+        }
+        return .{
+            .edges = edges,
+            .width = width,
+            .y = @intCast(@max(0, y_min)),
+            .y_end = @intCast(std.math.clamp(y_max, 0, height)),
+        };
+    }
+
+    pub fn next(self: *QuadSpans) ?Span {
+        while (self.y < self.y_end) {
+            const y = self.y;
+            self.y += 1;
+            const py = @as(f32, @floatFromInt(y)) + 0.5;
+            var left: f32 = std.math.inf(f32);
+            var right: f32 = -std.math.inf(f32);
+            var intersects = false;
+            for (self.edges) |e| {
+                const y0 = e.a[1];
+                const y1 = e.b[1];
+                const lo_y = @min(y0, y1);
+                const hi_y = @max(y0, y1);
+                // Skip degenerate horizontal edges and rows the edge never spans;
+                // a row center exactly on an endpoint is excluded (py is x.5, so a
+                // sharp top/bottom corner straddles both adjacent rows).
+                if (hi_y - lo_y <= 0 or py < lo_y or py > hi_y) continue;
+                const t = (py - y0) / (y1 - y0);
+                const x = e.a[0] + (e.b[0] - e.a[0]) * t;
+                left = @min(left, x);
+                right = @max(right, x);
+                intersects = true;
+            }
+            if (!intersects) continue;
+            // Draw a pixel iff its center (x+0.5) lies inside [left, right]. The
+            // right band is exclusive: floor(right-0.5)+1 so an 8px-wide / 1px-wide
+            // quad stays 8px / 1px and never spills into the next cell.
+            const x_start: i32 = @max(0, @as(i32, @intFromFloat(@ceil(left - 0.5))));
+            const x_end: i32 = @min(@as(i32, @intCast(self.width)), @as(i32, @intFromFloat(@floor(right - 0.5))) + 1);
+            if (x_end <= x_start) continue;
+            return .{ .x = @intCast(x_start), .y = y, .width = @intCast(x_end - x_start) };
+        }
+        return null;
+    }
+};
+
+pub fn fillQuad(
+    pixels: []u32,
+    stride: u31,
+    width: u31,
+    height: u31,
+    corners: [4][2]i32,
+    color: u32,
+) void {
+    var spans: QuadSpans = .init(width, height, corners);
+    while (spans.next()) |span| {
+        const start = @as(usize, span.y) * stride + span.x;
+        fillSpan(pixels[start..][0..span.width], color);
+    }
+}
+
 /// Alpha-blend an 8-bit coverage bitmap in `color` over the buffer.
 pub fn blitGlyph(
     pixels: []u32,
@@ -506,6 +590,88 @@ test "fillRect clips to a view while honoring framebuffer stride" {
     for (wide, 0..) |px, i| {
         const filled = i / stride == 1 and i % stride >= 1 and i % stride < 1201;
         try std.testing.expectEqual(if (filled) @as(u32, 0xff102030) else untouched, px);
+    }
+}
+
+test "fillQuad fills a sheared rectangle span" {
+    const untouched: u32 = 0x12345678;
+    var pixels: [8 * 5]u32 = @splat(untouched);
+    // A rectangle sheared right: top edge narrower than the bottom edge.
+    const corners = [_][2]i32{
+        .{ 1, 0 }, // top-left
+        .{ 3, 0 }, // top-right
+        .{ 6, 4 }, // bottom-right
+        .{ 4, 4 }, // bottom-left
+    };
+    fillQuad(&pixels, 8, 8, 5, corners, 0xffabcdef);
+    // The interior widens toward the bottom; each row clips to the span the
+    // quad actually covers at that row's center.
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[0 * 8 + 2]);
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[1 * 8 + 2]);
+    // Outer columns stay untouched (the sides slope inward toward the top).
+    try std.testing.expectEqual(untouched, pixels[0]);
+    try std.testing.expectEqual(untouched, pixels[4 * 8 + 0]);
+    try std.testing.expectEqual(untouched, pixels[4 * 8 + 6]);
+}
+
+test "fillQuad does not paint beyond a diagonally stretched quad" {
+    const untouched: u32 = 0x12345678;
+    var pixels: [12 * 6]u32 = @splat(untouched);
+    // A convex quad whose left and right edges span different vertical
+    // ranges: naive per-edge interpolation extrapolates one side far past
+    // its endpoints on rows only the other side bounds.
+    const corners = [_][2]i32{
+        .{ 1, 3 }, // top-left
+        .{ 4, 2 }, // top-right
+        .{ 7, 6 }, // bottom-right
+        .{ 3, 5 }, // bottom-left
+    };
+    fillQuad(&pixels, 12, 12, 6, corners, 0xffabcdef);
+    // Anchor rows inside the quad are painted.
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[3 * 12 + 3]);
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[3 * 12 + 4]);
+    // Rows outside the quad's vertical extent stay untouched, and no column
+    // left of the quad's left boundary is painted on an over-extended row.
+    try std.testing.expectEqual(untouched, pixels[0]);
+    try std.testing.expectEqual(untouched, pixels[1 * 12 + 0]);
+    try std.testing.expectEqual(untouched, pixels[5 * 12 + 3]);
+}
+
+test "fillQuad right edge is exclusive for an axis-aligned quad" {
+    const untouched: u32 = 0x12345678;
+    var pixels: [10 * 4]u32 = @splat(untouched);
+    // An 8px-wide block exactly fills spots 0..7; spot 8 is the first pixel
+    // of the neighbouring cell and must stay background, never 9px wide.
+    const corners = [_][2]i32{
+        .{ 0, 0 }, // top-left
+        .{ 8, 0 }, // top-right
+        .{ 8, 2 }, // bottom-right
+        .{ 0, 2 }, // bottom-left
+    };
+    fillQuad(&pixels, 10, 10, 4, corners, 0xffabcdef);
+    // Rows 0 and 1 are painted; rows 2 and 3 fall below the quad.
+    for (0..2) |y| {
+        for (0..8) |x| {
+            try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[y * 10 + x]);
+        }
+        try std.testing.expectEqual(untouched, pixels[y * 10 + 8]);
+        try std.testing.expectEqual(untouched, pixels[y * 10 + 9]);
+    }
+    try std.testing.expectEqual(untouched, pixels[2 * 10 + 0]);
+    try std.testing.expectEqual(untouched, pixels[3 * 10 + 0]);
+    // A 1px bar occupies a single column, not two.
+    var bar_pixels: [4 * 3]u32 = @splat(untouched);
+    const bar_corners = [_][2]i32{
+        .{ 1, 0 }, // top-left
+        .{ 2, 0 }, // top-right
+        .{ 2, 2 }, // bottom-right
+        .{ 1, 2 }, // bottom-left
+    };
+    fillQuad(&bar_pixels, 4, 4, 3, bar_corners, 0xffabcdef);
+    for (0..2) |y| {
+        try std.testing.expectEqual(@as(u32, 0xffabcdef), bar_pixels[y * 4 + 1]);
+        try std.testing.expectEqual(untouched, bar_pixels[y * 4 + 0]);
+        try std.testing.expectEqual(untouched, bar_pixels[y * 4 + 2]);
     }
 }
 

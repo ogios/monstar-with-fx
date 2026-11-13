@@ -105,10 +105,16 @@ pub fn deinit(self: *KittyDrag) void {
 /// Forget the client's registration, as on a terminal reset. The caller
 /// cancels any native drag.
 pub fn reset(self: *KittyDrag) void {
-    self.endSession();
+    self.cancel();
     self.enabled = false;
     self.local = true;
     self.client_id = 0;
+}
+
+/// Cancel a gesture or transfer while preserving the client's registration.
+/// The caller cancels the corresponding native drag.
+pub fn cancel(self: *KittyDrag) void {
+    self.endSession();
     self.chunking = .{};
     self.discarding = false;
 }
@@ -599,6 +605,22 @@ const Harness = struct {
         return &self.drag.offer.?.items.items[index];
     }
 };
+
+test "cancelling an incomplete offer preserves registration and permits a new gesture" {
+    var h: Harness = .init();
+    defer h.deinit();
+    try testing.expectEqual(Action.handled, try h.send("t=o:x=1:i=7", null));
+    try h.drag.requestDrag(&h.out.writer, origin);
+    try testing.expectEqual(Action.handled, try h.send("t=o:o=1:m=1", "text/"));
+    h.drag.cancel();
+    try testing.expect(h.drag.wantsGesture());
+    try testing.expectEqual(@as(u32, 7), h.drag.client_id);
+    try h.drag.requestDrag(&h.out.writer, origin);
+    try testing.expectEqual(Action.handled, try h.send("t=o:o=1", "text/plain"));
+    try testing.expectEqualStrings("text/plain", h.item(0).mime);
+    h.drag.reset();
+    try testing.expect(!h.drag.wantsGesture());
+}
 
 test "chunked offer and pre-sent data split mid-quantum start a drag" {
     var h: Harness = .init();

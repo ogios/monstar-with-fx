@@ -1,0 +1,15 @@
+# Autoloadable function invoked from .zshenv for interactive zsh shells.
+# Reports the working directory (OSC 7) and window title (OSC 2) at each
+# prompt, and the running command line as the title before each command.
+
+_monstar_precmd() {
+    builtin printf '\e]7;file://%s%s\a\e]2;%s\a' "$HOST" "$PWD" "${PWD/#$HOME/~}"
+}
+
+_monstar_preexec() {
+    builtin printf '\e]2;%s\a' "$1"
+}
+
+builtin typeset -ag precmd_functions preexec_functions
+precmd_functions=(${precmd_functions:#_monstar_precmd} _monstar_precmd)
+preexec_functions=(${preexec_functions:#_monstar_preexec} _monstar_preexec)

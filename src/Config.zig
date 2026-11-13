@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 const config_theme = @import("config_theme.zig");
 const keybind = @import("keybind.zig");
+const tab_bar = @import("tab_bar.zig");
 
 const log = std.log.scoped(.config);
 const baseline_dpi = 96.0;
@@ -161,6 +162,11 @@ image_storage_limit: usize = 320 * 1000 * 1000,
 mouse_scroll_multiplier: MouseScrollMultiplier = .{},
 /// Whether finger scrolling continues with inertial motion after release.
 inertial_scrolling: bool = true,
+/// What Ctrl+Shift+N opens: a new tab in the current window (default), or an
+/// independent window registered with the user service manager.
+new_window_mode: NewWindowMode = .tab,
+/// Which edge of the window the tab bar occupies.
+tab_bar_position: TabBarPosition = .bottom,
 /// Render scrollback movement in pixels rather than whole rows, easing
 /// mouse wheel steps.
 smooth_scrolling: bool = true,
@@ -183,10 +189,24 @@ background: ?vt.color.RGB = null,
 foreground: ?vt.color.RGB = null,
 cursor_color: ?TerminalColor = null,
 cursor_text: ?TerminalColor = null,
+/// Smooth Neovide-style cursor glide between cells. Disabled by
+/// reduced-motion or an explicit `cursor-animation = false`.
+cursor_animation: bool = true,
+/// Duration of a long cursor jump in milliseconds; 0 snaps instantly.
+cursor_animation_length: u32 = 150,
+/// Duration of a short horizontal (one or two cell) jump in milliseconds.
+cursor_animation_short: u32 = 40,
+/// How far the back of the cursor trails the front, 0 to 100 percent.
+cursor_animation_trail: u32 = 100,
 selection_background: ?vt.color.RGB = null,
 selection_foreground: ?vt.color.RGB = null,
 copy_highlight: ?vt.color.RGB = null,
 copy_highlight_foreground: ?vt.color.RGB = null,
+tab_bar_background: ?vt.color.RGB = null,
+active_tab_background: ?vt.color.RGB = null,
+active_tab_foreground: ?vt.color.RGB = null,
+inactive_tab_background: ?vt.color.RGB = null,
+inactive_tab_foreground: ?vt.color.RGB = null,
 palette: [256]?vt.color.RGB = @splat(null),
 
 /// How much `font_thicken` grows strokes. `auto` follows each glyph's text
@@ -211,6 +231,12 @@ pub const CommandFinishAction = struct {
     bell: bool = true,
     notify: bool = false,
 };
+
+/// How a new session is opened: as a tab (default) or a detached window.
+pub const NewWindowMode = enum { tab, window };
+
+/// Which edge of the window the tab bar occupies.
+pub const TabBarPosition = enum { top, bottom };
 
 /// Load the default config file, if any. Strings are allocated in `arena`
 /// and live as long as it does.
@@ -476,6 +502,10 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
             false
         else
             return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "new-window-mode")) {
+        self.new_window_mode = std.meta.stringToEnum(NewWindowMode, value) orelse return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "tab-bar-position")) {
+        self.tab_bar_position = std.meta.stringToEnum(TabBarPosition, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "smooth-scrolling")) {
         self.smooth_scrolling = if (std.mem.eql(u8, value, "true"))
             true
@@ -513,6 +543,14 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.cursor_color = try config_theme.parseTerminalColor(value);
     } else if (std.mem.eql(u8, key, "cursor-text")) {
         self.cursor_text = try config_theme.parseTerminalColor(value);
+    } else if (std.mem.eql(u8, key, "cursor-animation")) {
+        self.cursor_animation = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "cursor-animation-length")) {
+        self.cursor_animation_length = try parseMs(value);
+    } else if (std.mem.eql(u8, key, "cursor-animation-short")) {
+        self.cursor_animation_short = try parseMs(value);
+    } else if (std.mem.eql(u8, key, "cursor-animation-trail")) {
+        self.cursor_animation_trail = try parsePct(value);
     } else if (std.mem.eql(u8, key, "selection-background")) {
         self.selection_background = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "selection-foreground")) {
@@ -521,6 +559,16 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.copy_highlight = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "copy-highlight-foreground")) {
         self.copy_highlight_foreground = try config_theme.parseColor(value);
+    } else if (std.mem.eql(u8, key, "tab-bar-background")) {
+        self.tab_bar_background = try config_theme.parseColor(value);
+    } else if (std.mem.eql(u8, key, "active-tab-background")) {
+        self.active_tab_background = try config_theme.parseColor(value);
+    } else if (std.mem.eql(u8, key, "active-tab-foreground")) {
+        self.active_tab_foreground = try config_theme.parseColor(value);
+    } else if (std.mem.eql(u8, key, "inactive-tab-background")) {
+        self.inactive_tab_background = try config_theme.parseColor(value);
+    } else if (std.mem.eql(u8, key, "inactive-tab-foreground")) {
+        self.inactive_tab_foreground = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "palette")) {
         const entry = try config_theme.parsePaletteEntry(value);
         self.palette[entry.index] = entry.color;
@@ -678,6 +726,24 @@ fn parseScrollMultiplier(value: []const u8) error{InvalidValue}!f64 {
     return std.math.clamp(multiplier, 0.01, 10_000);
 }
 
+fn parseBool(value: []const u8) error{InvalidValue}!bool {
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    return error.InvalidValue;
+}
+
+fn parseMs(value: []const u8) error{InvalidValue}!u32 {
+    const ms = std.fmt.parseInt(u32, std.mem.trim(u8, value, " \t"), 10) catch return error.InvalidValue;
+    if (ms > 10_000) return error.InvalidValue;
+    return ms;
+}
+
+fn parsePct(value: []const u8) error{InvalidValue}!u32 {
+    const pct = std.fmt.parseInt(u32, std.mem.trim(u8, value, " \t"), 10) catch return error.InvalidValue;
+    if (pct > 100) return error.InvalidValue;
+    return pct;
+}
+
 fn parseOpacity(value: []const u8) error{InvalidValue}!u8 {
     const opacity = std.fmt.parseFloat(f64, std.mem.trim(u8, value, " \t")) catch return error.InvalidValue;
     if (!std.math.isFinite(opacity) or opacity < 0 or opacity > 1) return error.InvalidValue;
@@ -763,6 +829,28 @@ pub fn effectiveCopyHighlightForeground(self: *const Config, color_scheme: vt.de
     return self.effectiveColor(color_scheme, "copy_highlight_foreground");
 }
 
+fn namedTabColor(self: *const Config, color_scheme: vt.device_status.ColorScheme, comptime field: []const u8) ?vt.color.RGB {
+    const named = if (self.namedThemeOverrides(color_scheme)) |theme| @field(theme, field) else null;
+    return @field(self, field) orelse named;
+}
+
+pub fn effectiveTabBarColors(self: *const Config, color_scheme: vt.device_status.ColorScheme) tab_bar.Colors {
+    const defaults: tab_bar.Colors = .{};
+    var colors = defaults;
+    colors.background = self.namedTabColor(color_scheme, "tab_bar_background") orelse
+        self.namedTabColor(color_scheme, "inactive_tab_background") orelse defaults.background;
+    colors.active_background = self.namedTabColor(color_scheme, "active_tab_background") orelse defaults.active_background;
+    colors.active_title = self.namedTabColor(color_scheme, "active_tab_foreground") orelse defaults.active_title;
+    colors.inactive_title = self.namedTabColor(color_scheme, "inactive_tab_foreground") orelse defaults.inactive_title;
+    if (!colors.active_title.eql(defaults.active_title) or !colors.active_background.eql(defaults.active_background)) {
+        colors.active_index = config_theme.blend(colors.active_title, colors.active_background, 190);
+    }
+    if (!colors.inactive_title.eql(defaults.inactive_title) or !colors.background.eql(defaults.background)) {
+        colors.inactive_index = config_theme.blend(colors.inactive_title, colors.background, 173);
+    }
+    return colors;
+}
+
 pub fn effectiveCursorColor(self: *const Config, color_scheme: vt.device_status.ColorScheme) TerminalColor {
     const named = if (self.namedThemeOverrides(color_scheme)) |theme| theme.cursor_color else null;
     return config_theme.resolveTerminalColor(
@@ -844,6 +932,7 @@ test "defaults" {
     try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 3), config.mouse_scroll_multiplier.discrete);
     try std.testing.expect(config.inertial_scrolling);
+    try std.testing.expectEqual(NewWindowMode.tab, config.new_window_mode);
     try std.testing.expectEqual(@as(i16, -1), keybind.getEvent(config.keybinds.items, .{
         .key = .arrow_up,
         .mods = .{ .shift = true },
@@ -899,6 +988,8 @@ test "parse config" {
         \\keybind = ctrl+shift+k=scroll_page_lines:-5
         \\keybind = ctrl+shift+k=scroll_page_lines:invalid
         \\inertial-scrolling = false
+        \\new-window-mode = window
+        \\tab-bar-position = top
         \\copy-highlight-duration = 250
         \\background-opacity = 0.8
         \\background-blur = false
@@ -911,6 +1002,11 @@ test "parse config" {
         \\selection-foreground = #070809
         \\copy-highlight = #0a0b0c
         \\copy-highlight-foreground = #0d0e0f
+        \\tab-bar-background = #101112
+        \\active-tab-background = #131415
+        \\active-tab-foreground = #161718
+        \\inactive-tab-background = #191a1b
+        \\inactive-tab-foreground = #1c1d1e
         \\palette = 1=#f7768e
         \\palette = 200=#123456
         \\
@@ -944,6 +1040,8 @@ test "parse config" {
         .mods = .{ .alt = true },
     }).?.scroll_page_lines);
     try std.testing.expect(!config.inertial_scrolling);
+    try std.testing.expectEqual(NewWindowMode.window, config.new_window_mode);
+    try std.testing.expectEqual(TabBarPosition.top, config.tab_bar_position);
     try std.testing.expectEqual(@as(u32, 250), config.copy_highlight_duration);
     try std.testing.expectEqual(@as(u8, 204), config.background_opacity);
     try std.testing.expectEqual(BackgroundBlur.never, config.background_blur);
@@ -956,9 +1054,31 @@ test "parse config" {
     try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.selection_foreground.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 10, .g = 11, .b = 12 }, config.copy_highlight.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 13, .g = 14, .b = 15 }, config.copy_highlight_foreground.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x10, .g = 0x11, .b = 0x12 }, config.tab_bar_background.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x13, .g = 0x14, .b = 0x15 }, config.active_tab_background.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x16, .g = 0x17, .b = 0x18 }, config.active_tab_foreground.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x19, .g = 0x1a, .b = 0x1b }, config.inactive_tab_background.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x1c, .g = 0x1d, .b = 0x1e }, config.inactive_tab_foreground.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf7, .g = 0x76, .b = 0x8e }, config.palette[1].?);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.palette[2]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 }, config.palette[200].?);
+}
+
+test "tab bar defaults to a single background and accepts color overrides" {
+    var config: Config = .{};
+    try std.testing.expectEqual(tab_bar.Colors{}, config.effectiveTabBarColors(.dark));
+
+    const red: vt.color.RGB = .{ .r = 255, .g = 0, .b = 0 };
+    const blue: vt.color.RGB = .{ .r = 0, .g = 0, .b = 255 };
+    config.inactive_tab_background = red;
+    try std.testing.expectEqual(red, config.effectiveTabBarColors(.dark).background);
+    config.tab_bar_background = blue;
+    config.active_tab_background = red;
+    const colors = config.effectiveTabBarColors(.dark);
+    try std.testing.expectEqual(blue, colors.background);
+    try std.testing.expectEqual(red, colors.active_background);
+    try std.testing.expect(!colors.active_index.eql(colors.active_title));
+    try std.testing.expect(!colors.inactive_index.eql(colors.inactive_title));
 }
 
 test "command finish settings replace flags atomically and parse durations" {
@@ -1008,6 +1128,29 @@ test "unknown override is rejected" {
     try std.testing.expectError(
         error.UnknownKey,
         config.applyOverride(std.testing.allocator, "font-famly=monospace"),
+    );
+}
+
+test "new-window-mode rejects invalid values" {
+    var config: Config = .{};
+    try std.testing.expectError(
+        error.InvalidValue,
+        config.applyOverride(std.testing.allocator, "new-window-mode=float"),
+    );
+    try std.testing.expectError(
+        error.InvalidValue,
+        config.applyOverride(std.testing.allocator, "new-window-mode="),
+    );
+}
+
+test "tab-bar-position defaults to bottom and rejects invalid values" {
+    var config: Config = .{};
+    try std.testing.expectEqual(TabBarPosition.bottom, config.tab_bar_position);
+    try config.applyOverride(std.testing.allocator, "tab-bar-position=top");
+    try std.testing.expectEqual(TabBarPosition.top, config.tab_bar_position);
+    try std.testing.expectError(
+        error.InvalidValue,
+        config.applyOverride(std.testing.allocator, "tab-bar-position=middle"),
     );
 }
 

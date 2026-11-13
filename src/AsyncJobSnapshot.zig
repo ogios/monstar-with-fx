@@ -16,14 +16,23 @@ search_matches: std.ArrayList(bool) = .empty,
 scrollbar: ?Renderer.ScrollbarThumb = null,
 copy_brackets: ?Renderer.CopyBrackets = null,
 hyperlink_hints: bool = false,
+tab_bar: []Renderer.TabBarItem = &.{},
+/// Animated cursor quad, or null when no animation overlay is active.
+cursor_overlay: ?Renderer.CursorOverlay = null,
 kitty: []Renderer.KittyRenderItem = &.{},
+/// The cache that owns the pinned kitty items above. The active tab can change
+/// while a job is in flight, so release must return pins to this owner, never
+/// the currently-active tab's cache.
+kitty_cache: ?*KittyImageCache = null,
 
-pub fn deinit(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {
+pub fn deinit(self: *AsyncJobSnapshot, alloc: std.mem.Allocator) void {
     if (self.preedit) |value| alloc.free(value);
     if (self.link_hint) |value| alloc.free(value);
     if (self.search) |value| alloc.free(value);
+    for (self.tab_bar) |item| alloc.free(item.title);
+    alloc.free(self.tab_bar);
     self.search_matches.deinit(alloc);
-    self.releaseKitty(alloc, cache);
+    self.releaseKitty(alloc);
 }
 
 pub fn replaceOverlays(
@@ -65,10 +74,37 @@ pub fn replaceOverlays(
     self.hyperlink_hints = hyperlink_hints;
 }
 
-pub fn releaseKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {
-    for (self.kitty) |item| cache.release(item.image.id, item.image.generation);
+/// Replaces the owned tab-bar snapshot. On failure the existing snapshot is
+/// preserved.
+pub fn replaceTabBar(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, items: []const Renderer.TabBarItem) !void {
+    const new_items = try alloc.dupe(Renderer.TabBarItem, items);
+    errdefer alloc.free(new_items);
+    var duped: usize = 0;
+    errdefer for (new_items[0..duped]) |item| alloc.free(item.title);
+    for (new_items, 0..) |*item, i| {
+        _ = i;
+        item.title = try alloc.dupe(u8, item.title);
+        duped += 1;
+    }
+    for (self.tab_bar) |item| alloc.free(item.title);
+    alloc.free(self.tab_bar);
+    self.tab_bar = new_items;
+}
+
+/// Drop the pinned kitty pins against the cache that owns them and free the
+/// owned render items. `kitty_cache` is null when there is nothing to release.
+pub fn releaseKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator) void {
+    if (self.kitty_cache) |cache| {
+        for (self.kitty) |item| cache.release(item.image.id, item.image.generation);
+        cache.sweep(alloc);
+    }
     alloc.free(self.kitty);
     self.kitty = &.{};
+    self.kitty_cache = null;
+}
+
+pub fn setCursorOverlay(self: *AsyncJobSnapshot, overlay: ?Renderer.CursorOverlay) void {
+    self.cursor_overlay = overlay;
 }
 
 pub fn replaceKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache, items: []Renderer.KittyRenderItem) !void {
@@ -79,6 +115,10 @@ pub fn replaceKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *K
         item.image.data = .{ .complete = try cache.acquire(alloc, item.image) };
         acquired += 1;
     }
-    self.releaseKitty(alloc, cache);
+    // Release the previous pins against the cache that owns them; the active
+    // tab may differ after a switch, so never use the current tab's cache.
+    self.releaseKitty(alloc);
     self.kitty = items;
+    self.kitty_cache = if (items.len > 0) cache else null;
+    if (items.len > 0) cache.sweep(alloc);
 }

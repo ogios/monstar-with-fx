@@ -74,7 +74,7 @@ This setting is only accepted in configuration files, not with
 .BR \-o .
 .SH RELOADING
 Press
-.B Ctrl+Shift+,
+.B Ctrl+Shift+F5
 or send
 .B SIGUSR1
 to reload the configuration.
@@ -107,7 +107,9 @@ Set the child command used when no command is supplied on the command line.
 An unprefixed value, or one prefixed with
 .BR shell: ,
 is passed to
-.BR /bin/sh " " \-c .
+.BR /bin/sh " " \-c ,
+except for simple invocations of supported shells, which are executed directly
+so automatic shell integration can be enabled.
 A value prefixed with
 .B direct:
 is split on spaces and tabs and executed directly; shell quoting is not
@@ -374,6 +376,11 @@ Set minimum top and bottom padding in logical pixels.
 One value applies to both sides; two values set top and bottom independently.
 The default is zero.
 .TP
+.BI tab-bar-position " = top|bottom"
+Place the tab bar on the given edge of the window.
+The default is
+.BR bottom .
+.TP
 .BI window-height " = rows"
 Set the initial terminal grid height in cells.
 Takes effect only together with
@@ -555,6 +562,16 @@ An explicit color in the main configuration overrides the named theme.
 Runtime OSC color changes may override terminal, cursor, and selection colors
 until they are reset by the application.
 .TP
+.BI active-tab-background " = color"
+Set the color of the active tab's sliding highlight.
+The default is
+.BR #cba6f7 .
+.TP
+.BI active-tab-foreground " = color"
+Set the title color of the active tab.
+The default is
+.BR #1e1e2e .
+.TP
 .BI background " = color"
 Set the default terminal background.
 Built-in defaults are
@@ -609,6 +626,16 @@ in light mode and
 .B #ffffff
 in dark mode.
 .TP
+.BI inactive-tab-background " = color"
+Set the strip background when
+.B tab-bar-background
+is unset.
+.TP
+.BI inactive-tab-foreground " = color"
+Set the title color of inactive tabs.
+The default is
+.BR #cdd6f4 .
+.TP
 .BI palette " = index=color"
 Override one terminal palette entry.
 The index must be between 0 and 255 and may use decimal or a
@@ -634,19 +661,32 @@ Built-in defaults are
 in light mode and
 .B #ffffff
 in dark mode.
+.TP
+.BI tab-bar-background " = color"
+Set the background of the tab bar strip.
+The default is
+.BR #1e1e2e .
+.PP
+The strip shows each tab's number and title on a shared background.
+A rounded highlight slides under the active label when switching tabs.
 .SH THEME FILES
 Theme files use the same line syntax as the main configuration but accept only
 these color keys:
+.BR active-tab-background ,
+.BR active-tab-foreground ,
 .BR background ,
 .BR copy-highlight ,
 .BR copy-highlight-foreground ,
 .BR cursor-color ,
 .BR cursor-text ,
 .BR foreground ,
+.BR inactive-tab-background ,
+.BR inactive-tab-foreground ,
 .BR palette ,
 .BR selection-background ,
+.BR selection-foreground ,
 and
-.BR selection-foreground .
+.BR tab-bar-background .
 The
 .B palette
 key may be repeated.

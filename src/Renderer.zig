@@ -22,6 +22,7 @@ const kitty_graphics = @import("kitty_graphics.zig");
 const pixel_copy = @import("pixel_copy.zig");
 const pixel_raster = @import("pixel_raster.zig");
 const resize = @import("resize.zig");
+const tab_bar = @import("tab_bar.zig");
 
 const log = std.log.scoped(.renderer);
 const KittyImage = vt.kitty.graphics.Image;
@@ -56,6 +57,15 @@ const blendRgb = pixel_raster.blendRgb;
 const blitGlyph = pixel_raster.blitGlyph;
 const fillRect = pixel_raster.fillRect;
 
+/// An animated (Neovide-style) cursor drawn as a convex quad after the
+/// grid rows. Corners are top-left, top-right, bottom-right, bottom-left
+/// in grid pixel space. A fourth corner being sheared by independent
+/// springs gives the leading-edge/trailing-edge stretch.
+pub const CursorOverlay = struct {
+    corners: [4][2]i32,
+    shape: @import("CursorAnimator.zig").Shape,
+};
+
 alloc: std.mem.Allocator,
 font: *Font,
 text_shaper: TextShaper,
@@ -71,6 +81,21 @@ cursor_color: ?Config.TerminalColor,
 /// Explicit text color under a focused block cursor. Null preserves the
 /// terminal background fallback.
 cursor_text: ?Config.TerminalColor,
+/// Animated cursor quad drawn over the grid after rows are rendered.
+/// When set, the block cursor is NOT recolored in the cell pass — the
+/// overlay handles both the fill and the glyph recolor, so a gliding
+/// cursor correctly smears across intermediate cells.
+cursor_overlay: ?CursorOverlay = null,
+/// Inclusive grid-local row band that must be repainted alongside the
+/// dirty rows before the cursor overlay is composited, clearing the
+/// cells a gliding cursor vacated. `min > max` means no forced rows.
+/// Set by the cursor overlay's partial-render path.
+cursor_force_row_min: usize = std.math.maxInt(usize),
+cursor_force_row_max: usize = 0,
+/// The cursor quad drawn by the previous frame, so the next partial
+/// cursor render can repaint the rows it vacated. Cleared when the
+/// overlay is not drawn (settled or native cursor).
+last_cursor_quad: ?CursorOverlay = null,
 /// Alpha applied to the default terminal background and window padding.
 background_alpha: u8,
 /// Whether background alpha also applies to explicit terminal cell
@@ -320,6 +345,7 @@ pub fn draw(
             self.backgroundPixel(state.colors.background),
         );
     }
+    try self.drawCursorOverlay(state, canvas);
     if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
 }
 
@@ -408,6 +434,7 @@ pub fn drawWithKittyItems(
             rect.x0 <= 0 and rect.y0 <= 0 and rect.x1 >= canvas.width and rect.y1 >= canvas.height)
         {
             try self.renderKittyPlacement(canvas, final.image, final.viewport, false);
+            try self.drawCursorOverlay(state, canvas);
             if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
             return;
         }
@@ -455,6 +482,7 @@ pub fn drawWithKittyItems(
     }
 
     try self.renderKittyItems(items, canvas, .above_text);
+    try self.drawCursorOverlay(state, canvas);
     if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
 }
 
@@ -499,7 +527,7 @@ pub fn drawDirty(
     const all_dirty = rows.items(.dirty);
     var rendered_until: usize = 0;
     for (all_dirty[0..state.rows], 0..) |dirty, y| {
-        if (!dirty or !self.rowRepaints(y)) continue;
+        if (!self.rowRepaints(y, dirty)) continue;
         if (self.font.neighbor_row_overhang) {
             // Shrunk cells ink in both directions; repaint both neighbors.
             for (@max(y -| 1, rendered_until)..@min(state.rows, y + 2)) |row| {
@@ -518,12 +546,12 @@ pub fn drawDirty(
             try self.repaintRow(state, y - 1, null, canvas);
             if (keep) self.restoreStrip(y - 2, canvas);
         }
-        const cell_damage = if (self.partial_cell_raster and !inks_up and !inked_from_below)
+        const cell_damage = if (self.partial_cell_raster and !self.cursorForceRow(y) and !inks_up and !inked_from_below)
             self.cell_damage_tracker.damageForRow(y)
         else
             null;
         try self.repaintRow(state, y, cell_damage, canvas);
-        if (inked_from_below and !(all_dirty[y + 1] and self.rowRepaints(y + 1))) {
+        if (inked_from_below and !self.rowRepaints(y + 1, all_dirty[y + 1])) {
             // Redraw the unchanged row below only where it inks into this
             // row's freshly cleared strip.
             const strip_end: u31 = @intCast(@min(@as(u64, y + 1) * self.font.cell_height, canvas.height));
@@ -536,9 +564,10 @@ pub fn drawDirty(
     }
 }
 
-/// Whether renderDirty repaints dirty row `y` at all.
-fn rowRepaints(self: *const Renderer, y: usize) bool {
-    return !self.partial_cell_raster or self.cell_damage_tracker.damageForRow(y) != null;
+/// Whether the dirty pass repaints row `y`.
+fn rowRepaints(self: *const Renderer, y: usize, dirty: bool) bool {
+    return self.cursorForceRow(y) or
+        (dirty and (!self.partial_cell_raster or self.cell_damage_tracker.damageForRow(y) != null));
 }
 
 /// Repaint row `y` entirely, or only `cell_range` when given, and record the
@@ -613,6 +642,15 @@ fn restoreStrip(self: *Renderer, y: usize, canvas: Canvas) void {
         },
         .gpu => |list| list.clip_min_y = std.math.minInt(i32),
     }
+}
+
+/// Whether `y` falls in the cursor force-row band. The band repaints the
+/// rows a gliding cursor quad crossed so its vacated pixels are cleared
+/// before the new quad is composited on top. A band wider than the grid
+/// rows (min > max) forces nothing.
+fn cursorForceRow(self: *const Renderer, y: usize) bool {
+    return self.cursor_force_row_min <= self.cursor_force_row_max and
+        y >= self.cursor_force_row_min and y <= self.cursor_force_row_max;
 }
 
 fn recordRenderedRect(
@@ -900,6 +938,89 @@ pub fn drawLinkHint(
     );
 }
 
+/// Draw the animated cursor quad over the rendered grid. The quad is
+/// filled with the cursor background color; for a focused block cursor the
+/// destination cell's glyph is re-blitted in the cursor text color so the
+/// character stays readable under the sliding block. Bar/underline/hollow
+/// shapes only need the filled quad (the text underneath remains visible).
+pub fn drawCursorOverlay(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    canvas: Canvas,
+) !void {
+    // Remember the quad just drawn so the next partial cursor render can
+    // repaint the rows it vacated. Clearing to null when the overlay is
+    // absent lets a settle/full frame drop stale force rows.
+    self.last_cursor_quad = self.cursor_overlay;
+    const overlay = self.cursor_overlay orelse return;
+    if (!state.cursor.visible) return;
+    const colors = &state.colors;
+    const cursor = state.cursor;
+
+    const cell = cursorCellRgb(cursor.style, &cursor.cell, colors);
+    const fill = self.cursorFill(colors, cell.fg, cell.bg);
+    const text = self.cursorGlyph(colors, cell.fg, cell.bg);
+
+    const corners = overlay.corners;
+    try canvas.fillQuad(corners, argb(fill));
+
+    // Only a focused block cursor recolors the glyph underneath; bar and
+    // underline keep their cell text untouched.
+    if (overlay.shape != .block or !self.focused) return;
+
+    const viewport = cursor.viewport orelse return;
+    const x: u31 = @intCast(viewport.x -| @intFromBool(viewport.wide_tail));
+    const y: u31 = viewport.y;
+    if (y >= state.rows) return;
+    const rows = state.row_data.slice();
+    const row_cells = rows.items(.cells)[y];
+    if (x >= row_cells.len) return;
+
+    // Clip the glyph to the quad's horizontal extent so a partially
+    // covered destination cell shows text only within the block.
+    const quad_min_x = @as(i32, @intCast(@min(corners[0][0], corners[1][0])));
+    const quad_max_x = @as(i32, @intCast(@max(corners[2][0], corners[3][0])));
+    const prev_clip = self.glyph_clip_x;
+    self.glyph_clip_x = .{
+        .start = @max(0, quad_min_x),
+        .end = quad_max_x,
+    };
+    defer self.glyph_clip_x = prev_clip;
+
+    const raw = row_cells.items(.raw)[x];
+    const cp = glyph_constraints.cellCodepoint(raw);
+    if (cp == 0 or cp == kitty_placeholder) return;
+    const span: u31 = @min(2, glyph_constraints.cellSpan(raw));
+    const face_idx = self.font.faceForCodepoint(self.alloc, cp);
+    const baseline_y: i32 = @as(i32, y) * self.font.cell_height + self.font.baseline;
+    if (face_idx == Font.sprite_face_index) {
+        const g = try self.font.spriteGlyph(self.alloc, cp, @intCast(span));
+        self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
+        try canvas.blitGlyph(
+            g,
+            @as(i32, @intCast(x)) * self.font.cell_width + g.bearing_x,
+            baseline_y - g.bearing_y,
+            argb(text),
+            false,
+            self.glyph_clip_x,
+        );
+        return;
+    }
+    const face = self.font.face(face_idx);
+    const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+    if (glyph_idx == 0) return;
+    const g = try face.glyph(self.alloc, glyph_idx, @intCast(span), glyph_constraints.isSymbol(cp));
+    self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
+    try canvas.blitGlyph(
+        g,
+        @as(i32, @intCast(x)) * self.font.cell_width + g.bearing_x,
+        baseline_y - g.bearing_y,
+        argb(text),
+        false,
+        self.glyph_clip_x,
+    );
+}
+
 pub fn drawSearch(
     self: *Renderer,
     state: *const vt.RenderState,
@@ -1111,6 +1232,382 @@ fn renderTextOverlay(
         }
         x += span;
     }
+}
+
+/// One tab rendered in the tab bar strip.
+pub const TabBarItem = struct {
+    id: u64 = 0,
+    title: []const u8,
+    active: bool,
+};
+
+const TabLayout = struct {
+    cells: []u31,
+    active_index: ?usize,
+    cell_width: u31,
+    inset: u31,
+    width: u31,
+
+    fn init(alloc: std.mem.Allocator, items: []const TabBarItem, width: u31, cell_width: u31, cell_height: u31) !TabLayout {
+        const inset = @min(tab_bar.inset(cell_height), (width -| cell_width) / 2);
+        const inner_width = width - 2 * inset;
+        const cells = try alloc.alloc(u31, 2 * items.len);
+        errdefer alloc.free(cells);
+        const desired = cells[0..items.len];
+        var active_index: ?usize = null;
+        var codepoints: std.ArrayList(u21) = .empty;
+        defer codepoints.deinit(alloc);
+        for (items, 0..) |item, i| {
+            codepoints.clearRetainingCapacity();
+            var it = (try std.unicode.Utf8View.init(item.title)).iterator();
+            while (it.nextCodepoint()) |cp| try codepoints.append(alloc, cp);
+            const title_width = overlayText(codepoints.items, std.math.maxInt(u31), false).width;
+            const number_width = @as(u31, std.math.log10_int(i + 1)) + 1;
+            // The allocator reserves one cell for every tab. The remaining
+            // budget covers the rest of the number, the spaces, and the title.
+            desired[i] = title_width +| (number_width + 1 + @as(u31, @intFromBool(item.title.len != 0)));
+            if (item.active) active_index = i;
+        }
+        tabTitleBudgets(desired, cells[items.len..], inner_width / cell_width, active_index orelse 0);
+        return .{
+            .cells = cells,
+            .active_index = active_index,
+            .cell_width = cell_width,
+            .inset = inset,
+            .width = inner_width,
+        };
+    }
+
+    fn boxes(self: TabLayout) Boxes {
+        return .{
+            .budgets = self.cells[self.cells.len / 2 ..],
+            .end = self.inset + self.width,
+            .cell_width = self.cell_width,
+            .left = self.inset,
+        };
+    }
+
+    fn activeHighlight(self: TabLayout) ?tab_bar.Highlight {
+        const active_index = self.active_index orelse return null;
+        var iter = self.boxes();
+        for (0..active_index) |_| _ = iter.next() orelse return null;
+        return iter.next();
+    }
+
+    const Boxes = struct {
+        budgets: []const u31,
+        end: u31,
+        cell_width: u31,
+        left: u31,
+
+        fn next(self: *Boxes) ?tab_bar.Highlight {
+            const remaining_cells = (self.end - self.left) / self.cell_width;
+            if (self.budgets.len == 0 or remaining_cells == 0) return null;
+            const budget = @min(self.budgets[0], remaining_cells - 1);
+            self.budgets = self.budgets[1..];
+            const right = self.left + (budget + 1) * self.cell_width;
+            const box: tab_bar.Highlight = .{ .left = self.left, .right = right };
+            self.left = right;
+            return box;
+        }
+    };
+};
+
+/// Returns the tab box under the physical x coordinate, or null in unused space.
+pub fn tabBarItemAt(
+    alloc: std.mem.Allocator,
+    items: []const TabBarItem,
+    width: u31,
+    cell_width: u31,
+    cell_height: u31,
+    x: u31,
+) !?usize {
+    if (cell_width == 0 or x >= width) return null;
+    const layout: TabLayout = try .init(alloc, items, width, cell_width, cell_height);
+    defer alloc.free(layout.cells);
+    if (x < layout.inset) return null;
+    var boxes = layout.boxes();
+    for (0..items.len) |i| {
+        const box = boxes.next() orelse break;
+        if (x < box.right) return i;
+    }
+    return null;
+}
+
+/// Settled highlight bounds for the current labels and physical strip width.
+pub fn tabBarActiveHighlight(alloc: std.mem.Allocator, items: []const TabBarItem, width: u31, cell_width: u31, cell_height: u31) !?tab_bar.Highlight {
+    if (cell_width == 0 or width < cell_width) return null;
+    const layout: TabLayout = try .init(alloc, items, width, cell_width, cell_height);
+    defer alloc.free(layout.cells);
+    return layout.activeHighlight();
+}
+
+/// Visible labels and their settled positions. Titles are borrowed from items.
+pub fn tabBarLabels(alloc: std.mem.Allocator, items: []const TabBarItem, width: u31, cell_width: u31, cell_height: u31) ![]tab_bar.Label {
+    if (cell_width == 0 or width < cell_width) return &.{};
+    const layout: TabLayout = try .init(alloc, items, width, cell_width, cell_height);
+    defer alloc.free(layout.cells);
+    var labels: std.ArrayList(tab_bar.Label) = .empty;
+    errdefer labels.deinit(alloc);
+    var boxes = layout.boxes();
+    for (items, 1..) |item, index| {
+        const box = boxes.next() orelse break;
+        try labels.append(alloc, .{ .id = item.id, .index = index, .title = item.title, .bounds = box });
+    }
+    return labels.toOwnedSlice(alloc);
+}
+
+/// Draw the tab bar into a canvas clipped to the strip. An explicit highlight
+/// supplies the current animation bounds in strip-local physical pixels.
+pub fn drawTabBar(
+    self: *Renderer,
+    canvas: Canvas,
+    items: []const TabBarItem,
+    colors: tab_bar.Colors,
+    highlight: ?tab_bar.Highlight,
+    transition: ?tab_bar.Transition.Frame,
+) !void {
+    if (canvas.height == 0 or canvas.width == 0) return;
+    const background = self.backgroundPixel(colors.background);
+    try canvas.fillRect(0, 0, canvas.width, canvas.height, background);
+    const cell_w = self.font.cell_width;
+    const cell_h = self.font.cell_height;
+    if (cell_w == 0 or cell_h == 0 or items.len == 0) return;
+    const row_height = @min(canvas.height, cell_h);
+    const row_top = (canvas.height - row_height) / 2;
+    const layout: TabLayout = try .init(self.alloc, items, canvas.width, cell_w, cell_h);
+    defer self.alloc.free(layout.cells);
+
+    const visible = highlight orelse layout.activeHighlight();
+    if (visible) |bounds| try drawTabHighlight(canvas, bounds, row_top, row_height, colors.active_background, background);
+    const baseline_y = @as(i32, row_top) + self.font.baseline - @as(i32, (cell_h - row_height) / 2);
+    if (transition) |frame| {
+        for (0..frame.tracks.len) |i| {
+            try self.drawTabLabel(canvas, frame.labelAt(i), frame.labelWidth(i), baseline_y, colors, visible);
+        }
+        return;
+    }
+    var boxes = layout.boxes();
+    for (items, 1..) |item, index| {
+        const box = boxes.next() orelse break;
+        const label: tab_bar.Label = .{ .id = item.id, .index = index, .title = item.title, .bounds = box };
+        try self.drawTabLabel(canvas, label, box.right - box.left, baseline_y, colors, visible);
+    }
+}
+
+fn drawTabLabel(
+    self: *Renderer,
+    canvas: Canvas,
+    label: tab_bar.Label,
+    layout_width: u31,
+    baseline_y: i32,
+    colors: tab_bar.Colors,
+    highlight: ?tab_bar.Highlight,
+) !void {
+    const left = label.bounds.left;
+    const right = @min(label.bounds.right, canvas.width);
+    if (left >= right) return;
+    const view = canvas.view(left, 0, right - left, canvas.height);
+    const visible: ?tab_bar.Highlight = if (highlight) |bounds| .{ .left = bounds.left -| left, .right = bounds.right -| left } else null;
+    const title_colors: TabTitleColors = .{ .active = colors.active_title, .inactive = colors.inactive_title, .highlight = visible };
+    const index_colors: TabTitleColors = .{ .active = colors.active_index, .inactive = colors.inactive_index, .highlight = visible };
+    const cell_w = self.font.cell_width;
+    const box_cells = layout_width / cell_w;
+    var digits: [20]u8 = undefined;
+    const number = std.fmt.bufPrint(&digits, "{d}", .{label.index}) catch unreachable;
+    const number_width: u31 = @intCast(number.len);
+    const number_x = if (box_cells >= number_width + 2) cell_w else 0;
+    for (number[0..@min(number.len, box_cells)], 0..) |digit, i| {
+        try self.blitTabCluster(view, digit, 1, number_x + @as(u31, @intCast(i)) * cell_w, baseline_y, index_colors);
+    }
+    const title_cells = box_cells -| (number_width + 3);
+    if (title_cells == 0) return;
+
+    const title_x = number_x + (number_width + 1) * cell_w;
+    const cps = try self.overlayCodepoints(label.title);
+    const full_width = overlayText(cps, std.math.maxInt(u31), false).width;
+    if (full_width <= title_cells) {
+        try self.drawTabClusters(view, cps, full_width, title_x, baseline_y, title_colors);
+    } else {
+        const shortened = overlayText(cps, title_cells - 1, false);
+        try self.drawTabClusters(view, cps, shortened.width, title_x, baseline_y, title_colors);
+        try self.drawTabClusters(view, &.{'…'}, 1, title_x + shortened.width * cell_w, baseline_y, title_colors);
+    }
+}
+
+fn drawTabHighlight(
+    canvas: Canvas,
+    bounds: tab_bar.Highlight,
+    top: u31,
+    height: u31,
+    color: vt.color.RGB,
+    background: u32,
+) !void {
+    const right = @min(bounds.right, canvas.width);
+    if (right <= bounds.left) return;
+    const width = right - bounds.left;
+    const fill = argb(color);
+    const corner_rows = @min(height / 2, @as(u31, @intCast((@as(u64, height) * 231 + 529) / 530)));
+    try canvas.fillRect(bounds.left, top + corner_rows, width, height - 2 * corner_rows, fill);
+
+    // Sample the corner vertically and integrate its horizontal coverage.
+    // Only the two edges need antialiasing; the interior is a solid span.
+    for (0..corner_rows) |i| {
+        const row: u31 = @intCast(i);
+        const y = top + row;
+        const opposite = top + height - 1 - row;
+        var edges: [4]f64 = undefined;
+        for (&edges, 0..) |*edge, sample| {
+            const distance = @as(f64, @floatFromInt(row)) + (@as(f64, @floatFromInt(sample)) + 0.5) / 4;
+            edge.* = tab_bar.cornerInset(width, height, distance);
+        }
+        var inset: u31 = @intFromFloat(@floor(edges[3]));
+        while (inset < (width + @as(u32, 1)) / 2) : (inset += 1) {
+            const x: f64 = @floatFromInt(inset);
+            var coverage: f64 = 0;
+            for (edges) |edge| {
+                const far_edge = @as(f64, @floatFromInt(width)) - edge;
+                coverage += @max(0, @min(x + 1, far_edge) - @max(x, edge));
+            }
+            const alpha: u8 = @intFromFloat(@round(coverage * (255.0 / 4.0)));
+            if (alpha == 255) break;
+            const pixel = blendPixel(background, &.{ color.r, color.g, color.b, alpha });
+            try canvas.fillRect(bounds.left + inset, y, 1, 1, pixel);
+            try canvas.fillRect(right - 1 - inset, y, 1, 1, pixel);
+            try canvas.fillRect(bounds.left + inset, opposite, 1, 1, pixel);
+            try canvas.fillRect(right - 1 - inset, opposite, 1, 1, pixel);
+        }
+        if (2 * @as(u32, inset) < width) {
+            try canvas.fillRect(bounds.left + inset, y, width - 2 * inset, 1, fill);
+            try canvas.fillRect(bounds.left + inset, opposite, width - 2 * inset, 1, fill);
+        }
+    }
+}
+
+const TabTitleColors = struct {
+    active: vt.color.RGB,
+    inactive: vt.color.RGB,
+    highlight: ?tab_bar.Highlight,
+};
+
+fn renderTabBar(self: *Renderer, pixels: []u32, width: u31, height: u31, items: []const TabBarItem, colors: tab_bar.Colors) !void {
+    try self.drawTabBar(self.pixelCanvas(pixels, width, height), items, colors, null, null);
+}
+
+/// Assign each tab a label budget in addition to its first cell. Tabs that
+/// need fewer cells return the leftover to longer labels.
+fn tabTitleBudgets(desired: []const u31, budgets: []u31, total_cells: u31, active_idx: usize) void {
+    std.debug.assert(desired.len == budgets.len);
+    const n: u32 = @intCast(desired.len);
+    if (n == 0) return;
+    std.debug.assert(active_idx < desired.len);
+
+    const reserved: u32 = n;
+    const total: u32 = total_cells;
+    const text_total: u32 = if (total > reserved) total - reserved else 0;
+    var wanted: u32 = 0;
+    for (desired) |cells| wanted +|= cells;
+    if (wanted <= text_total) {
+        @memcpy(budgets, desired);
+        return;
+    }
+    const default_budget: u31 = @intCast(text_total / n);
+
+    var extra: u32 = 0;
+    for (desired, 0..) |w, i| {
+        if (w < default_budget) {
+            budgets[i] = w;
+            extra += @as(u32, default_budget) - w;
+        } else {
+            budgets[i] = default_budget;
+        }
+    }
+    if (extra == 0) return;
+
+    // Active tab gets first claim on the leftover.
+    if (desired[active_idx] > budgets[active_idx]) {
+        const d: u32 = @min(extra, @as(u32, desired[active_idx]) - budgets[active_idx]);
+        budgets[active_idx] += @intCast(d);
+        extra -= d;
+    }
+    if (extra == 0) return;
+
+    // Split what remains among tabs whose titles still overflow.
+    var over: u32 = 0;
+    for (desired, 0..) |w, i| {
+        if (w > budgets[i]) over += 1;
+    }
+    if (over == 0) return;
+    const amt: u32 = extra / over;
+    if (amt == 0) return;
+    for (desired, 0..) |w, i| {
+        if (w > budgets[i]) {
+            const room: u32 = @as(u32, w) - budgets[i];
+            budgets[i] += @intCast(@min(amt, room));
+        }
+    }
+}
+
+/// Draw up to `max_cells` columns of `cps` starting at `start_x`, splitting
+/// on grapheme boundaries so a wide cluster is never half-drawn.
+fn drawTabClusters(
+    self: *Renderer,
+    canvas: Canvas,
+    cps: []const u21,
+    max_cells: u31,
+    start_x: u31,
+    baseline_y: i32,
+    colors: TabTitleColors,
+) !void {
+    var tx = start_x;
+    var drawn: u31 = 0;
+    var i: usize = 0;
+    while (i < cps.len) {
+        const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
+        if (cluster.len == 0) break;
+        const cp = cps[i];
+        i += cluster.len;
+        const span: u31 = cluster.width;
+        if (span == 0) continue;
+        if (drawn + span > max_cells) break;
+        try self.blitTabCluster(canvas, cp, span, tx, baseline_y, colors);
+        tx += span * self.font.cell_width;
+        drawn += span;
+    }
+}
+
+fn blitTabCluster(
+    self: *Renderer,
+    canvas: Canvas,
+    cp: u21,
+    span: u31,
+    x_px: u31,
+    baseline_y: i32,
+    colors: TabTitleColors,
+) !void {
+    const face_idx = self.font.faceForCodepoint(self.alloc, cp);
+    const glyph = if (face_idx == Font.sprite_face_index)
+        try self.font.spriteGlyph(self.alloc, cp, @intCast(@min(span, 2)))
+    else glyph: {
+        const face = self.font.face(face_idx);
+        const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+        break :glyph if (glyph_idx == 0) null else try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
+    };
+    const g = glyph orelse return;
+    const x = @as(i32, x_px) + g.bearing_x;
+    const y = baseline_y - g.bearing_y;
+    const bounds = colors.highlight orelse {
+        try canvas.blitGlyph(g, x, y, argb(colors.inactive), false, null);
+        return;
+    };
+
+    // Split ink at the moving edges without changing glyph positions.
+    const end = x + g.width;
+    const left = std.math.clamp(@as(i32, bounds.left), x, end);
+    const right = std.math.clamp(@as(i32, bounds.right), left, end);
+    if (x < left) try canvas.blitGlyph(g, x, y, argb(colors.inactive), false, .{ .start = x, .end = left });
+    if (left < right) try canvas.blitGlyph(g, x, y, argb(colors.active), false, .{ .start = left, .end = right });
+    if (right < end) try canvas.blitGlyph(g, x, y, argb(colors.inactive), false, .{ .start = right, .end = end });
 }
 
 fn renderKittyItems(
@@ -1795,8 +2292,11 @@ fn prepareRowCells(
         // after the cell backgrounds so it can retain the font's natural
         // canvas.height when the cell canvas.height is adjusted. All other cursor shapes
         // (and any unfocused cursor) overlay a sprite after drawing instead.
+        // When an animated cursor overlay is active it owns both fill and
+        // recolor, so the cell itself stays in its normal colors.
         if (cursor_x != null and cursor_x.? == x and
-            state.cursor.visual_style == .block and self.focused)
+            state.cursor.visual_style == .block and self.focused and
+            self.cursor_overlay == null)
         {
             const cell = cursorCellRgb(style, &raws[x], colors);
             fg = self.cursorGlyph(colors, cell.fg, cell.bg);
@@ -2021,8 +2521,10 @@ fn renderRowForegroundCells(
 
     // Non-block cursor shapes (DECSCUSR bar/underline, hollow block)
     // overlay the cell rather than recoloring it. Without keyboard
-    // focus the cursor is always a hollow rectangle.
+    // focus the cursor is always a hollow rectangle. When an animated
+    // cursor overlay is active it owns the shape, so skip the sprite.
     if (cursor_x) |cx| cursor: {
+        if (self.cursor_overlay != null) break :cursor;
         if (cx < range_start or cx >= range_end) break :cursor;
         const kind: ?@import("sprite.zig").Decoration = if (!self.focused)
             .cursor_hollow_rect
@@ -2870,6 +3372,137 @@ test "scrollback viewport scrolls and renders older content" {
     try std.testing.expect(pages.viewport == .active);
 }
 
+test "tab titles render sprite glyphs alongside their index" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    const cw = font.cell_width;
+    const inset = tab_bar.inset(font.cell_height);
+    const width = cw * 5 + 2 * inset;
+    const height = tab_bar.stripHeight(font.cell_height);
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const colors: tab_bar.Colors = .{};
+    try renderer.renderTabBar(pixels, width, height, &.{.{ .title = "─", .active = false }}, colors);
+
+    var number_ink = false;
+    var title_ink = false;
+    for (0..height) |y| {
+        const row = pixels[y * width ..][0..width];
+        for (row[inset + cw ..][0..cw]) |pixel| number_ink = number_ink or pixel != argb(colors.background);
+        for (row[inset + 3 * cw ..][0..cw]) |pixel| title_ink = title_ink or pixel != argb(colors.background);
+    }
+    try std.testing.expect(number_ink and title_ink);
+}
+
+test "tab title budgets elide long titles and favor the active tab" {
+    var budgets: [4]u31 = undefined;
+    {
+        const ideal = [_]u31{ 3, 20, 40, 5 };
+        tabTitleBudgets(&ideal, &budgets, 20, 2);
+        try std.testing.expectEqualSlices(u31, &.{ 3, 4, 5, 4 }, &budgets);
+    }
+    {
+        const ideal = [_]u31{ 2, 2, 40, 40 };
+        tabTitleBudgets(&ideal, &budgets, 30, 0);
+        try std.testing.expectEqualSlices(u31, &.{ 2, 2, 10, 10 }, &budgets);
+    }
+}
+
+test "tab bar hit testing includes the number and padding in each label" {
+    const items = [_]TabBarItem{
+        .{ .title = "a", .active = false },
+        .{ .title = "bbbbbbbb", .active = true },
+    };
+    const cw = 10;
+    const ch = 20;
+    const inset = tab_bar.inset(ch);
+    const width = 17 * cw + 2 * inset;
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(?usize, null), try tabBarItemAt(alloc, &items, width, cw, ch, inset - 1));
+    try std.testing.expectEqual(@as(?usize, 0), try tabBarItemAt(alloc, &items, width, cw, ch, inset));
+    try std.testing.expectEqual(@as(?usize, 0), try tabBarItemAt(alloc, &items, width, cw, ch, inset + 5 * cw - 1));
+    try std.testing.expectEqual(@as(?usize, 1), try tabBarItemAt(alloc, &items, width, cw, ch, inset + 5 * cw));
+    try std.testing.expectEqual(@as(?usize, null), try tabBarItemAt(alloc, &items, width, cw, ch, inset + 17 * cw));
+
+    const highlight = try tabBarActiveHighlight(alloc, &items, width, cw, ch);
+    try std.testing.expectEqual(tab_bar.Highlight{ .left = inset + 5 * cw, .right = inset + 17 * cw }, highlight.?);
+}
+
+test "tab bar hit testing leaves unused tail unclaimed" {
+    const items = [_]TabBarItem{
+        .{ .title = "long first title", .active = true },
+        .{ .title = "long second title", .active = false },
+        .{ .title = "long third title", .active = false },
+    };
+    const cw = 10;
+    const ch = 20;
+    const inset = tab_bar.inset(ch);
+    const width = 8 * cw + 2 * inset;
+
+    try std.testing.expectEqual(@as(?usize, 2), try tabBarItemAt(std.testing.allocator, &items, width, cw, ch, inset + 59));
+    try std.testing.expectEqual(@as(?usize, null), try tabBarItemAt(std.testing.allocator, &items, width, cw, ch, inset + 60));
+}
+
+test "narrow tab bar elides titles but still draws the active tab" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    const width = font.cell_width * 8;
+    const height = tab_bar.stripHeight(font.cell_height);
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const items = [_]TabBarItem{
+        .{ .title = "a very long first tab title", .active = false },
+        .{ .title = "another quite long title", .active = false },
+        .{ .title = "the active tab with a long title", .active = true },
+    };
+    const colors: tab_bar.Colors = .{};
+    try renderer.renderTabBar(pixels, width, height, &items, colors);
+    try std.testing.expect(std.mem.containsAtLeastScalar(u32, pixels, argb(colors.active_background), 1));
+}
+
+test "tab bar has a flat background and a highlight with straight sides" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    const cw = font.cell_width;
+    const ch = font.cell_height;
+    const inset = tab_bar.inset(ch);
+    const width = cw * 24 + 2 * inset;
+    const height = tab_bar.stripHeight(ch);
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const items = [_]TabBarItem{
+        .{ .title = "Editor", .active = true },
+        .{ .title = "Build", .active = false },
+    };
+    const colors: tab_bar.Colors = .{};
+    try renderer.renderTabBar(pixels, width, height, &items, colors);
+
+    const bg = argb(colors.background);
+    const active = argb(colors.active_background);
+    for (0..inset) |y| {
+        try std.testing.expect(std.mem.allEqual(u32, pixels[y * width ..][0..width], bg));
+    }
+    try std.testing.expectEqual(bg, pixels[@as(usize, inset) * width + inset]);
+    try std.testing.expectEqual(active, pixels[@as(usize, inset) * width + inset + 5 * cw]);
+    for (ch / 2 - 1..ch / 2 + 2) |y| {
+        const row = pixels[(y + inset) * width ..][0..width];
+        try std.testing.expectEqual(active, row[inset]);
+        try std.testing.expectEqual(active, row[inset + 10 * cw - 1]);
+        try std.testing.expect(std.mem.allEqual(u32, row[inset + 10 * cw ..][0..cw], bg));
+        try std.testing.expect(std.mem.allEqual(u32, row[inset + 19 * cw ..], bg));
+    }
+}
+
 test "preedit renders sprite glyphs alongside font glyphs" {
     try testSpriteOverlay(.preedit);
 }
@@ -3123,6 +3756,51 @@ test "focused block cursor keeps natural height in an expanded cell" {
         argb(state.colors.foreground),
         pixels[@as(usize, 2) * width + x],
     );
+}
+
+test "cursor overlay fills the quad with the cursor color" {
+    const alloc = std.testing.allocator;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{
+        .cursor_color = .cell_foreground,
+    });
+    defer renderer.deinit();
+
+    const width = font.cell_width * 2;
+    const height = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    const cw: i32 = @intCast(font.cell_width);
+    const ch: i32 = @intCast(font.cell_height);
+    // A block cursor spanning the first cell.
+    renderer.cursor_overlay = .{
+        .corners = .{
+            .{ 0, 0 },
+            .{ cw, 0 },
+            .{ cw, ch },
+            .{ 0, ch },
+        },
+        .shape = .block,
+    };
+    try renderer.render(&state, pixels, width, height);
+
+    // The first cell is painted with the no-OSC12 cursor fill (foreground).
+    const cw_us = @as(usize, @intCast(font.cell_width));
+    const cell_bottom = @as(usize, @intCast(font.cell_height / 2)) * @as(usize, width);
+    const center = cell_bottom + cw_us / 2;
+    try std.testing.expectEqual(argb(state.colors.foreground), pixels[center]);
+    // The second cell is untouched background.
+    const other = cell_bottom + cw_us + cw_us / 2;
+    try std.testing.expectEqual(argb(state.colors.background), pixels[other]);
 }
 
 test "cursor fill and glyph helpers follow TerminalColor" {

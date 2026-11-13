@@ -115,6 +115,19 @@ pub fn fillRect(self: Canvas, x: u31, y: u31, w: u31, h: u31, color: u32) !void 
     }
 }
 
+/// Fill a clipped cursor quadrilateral using the same spans on each target.
+pub fn fillQuad(self: Canvas, corners: [4][2]i32, color: u32) !void {
+    switch (self.target) {
+        .pixels => |pixels| pixel_raster.fillQuad(pixels, self.stride, self.width, self.height, corners, color),
+        .gpu => {
+            var spans: pixel_raster.QuadSpans = .init(self.width, self.height, corners);
+            while (spans.next()) |span| {
+                try self.fillRect(span.x, span.y, span.width, 1, color);
+            }
+        },
+    }
+}
+
 /// Blend glyph `g` with its top-left at (`x0`, `y0`); see pixel_raster.blitGlyph.
 pub fn blitGlyph(
     self: Canvas,

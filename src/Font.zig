@@ -1050,31 +1050,40 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     // one; positions are expressed from the cell top, like ghostty.
     const ft_face = faces.items[0].ft_face;
     const y_scale: i64 = ft_face.*.size.*.metrics.y_scale;
+    // x-height: measured from the font, estimated otherwise.
+    const ex_height: i64 = ex: {
+        const idx = c.FT_Get_Char_Index(ft_face, 'x');
+        if (idx != 0 and c.FT_Load_Glyph(ft_face, idx, c.FT_LOAD_DEFAULT) == 0) {
+            break :ex @intCast(ft_face.*.glyph.*.metrics.horiBearingY >> 6);
+        }
+        break :ex @divTrunc(@as(i64, ink_height) * 3, 10);
+    };
+    // Line thickness follows the font's underline thickness (scaled to
+    // pixels) and is rounded up, with a fallback for fonts lacking one;
+    // both paths clamp to a minimum of 1px so lines never collapse to a
+    // hairline, matching ghostty.
     const thickness: u32 = thickness: {
         const units: i64 = ft_face.*.underline_thickness;
         if (units > 0) break :thickness lineThickness(units, y_scale);
-        break :thickness @max(1, ink_height / 16);
+        break :thickness @intCast(@max(1, @divTrunc(ex_height * 15 + 99, 100)));
     };
+    // Text decorations floor at 2px so underlines stay bold even when the
+    // font's own thickness is sub-pixel; box drawing, overline, and cursor
+    // keep the thinner base.
+    const deco_thickness: u32 = @max(2, thickness);
 
     // FreeType underline position: relative to baseline, +up.
     const underline_position: u32 = position: {
         const units: i64 = ft_face.*.underline_position;
         const scaled: i64 = @divTrunc(units * y_scale, 1 << 22);
         const top: i64 = baseline - scaled;
-        break :position @intCast(std.math.clamp(top, 0, cell_height -| thickness));
+        break :position @intCast(std.math.clamp(top, 0, cell_height -| deco_thickness));
     };
 
     // Center the strikethrough on lowercase text (x-height).
     const strikethrough_position: u32 = position: {
-        const ex_height: i64 = ex: {
-            const idx = c.FT_Get_Char_Index(ft_face, 'x');
-            if (idx != 0 and c.FT_Load_Glyph(ft_face, idx, c.FT_LOAD_DEFAULT) == 0) {
-                break :ex @intCast(ft_face.*.glyph.*.metrics.horiBearingY >> 6);
-            }
-            break :ex @divTrunc(@as(i64, ink_height) * 3, 10);
-        };
-        const top: i64 = baseline - @divTrunc(ex_height + thickness, 2);
-        break :position @intCast(std.math.clamp(top, 0, cell_height -| thickness));
+        const top: i64 = baseline - @divTrunc(ex_height + deco_thickness, 2);
+        break :position @intCast(std.math.clamp(top, 0, cell_height -| deco_thickness));
     };
 
     return .{
@@ -1094,9 +1103,9 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
             .cell_height = cell_height,
             .box_thickness = adjustThickness(thickness, adjustments.box_thickness),
             .underline_position = underline_position,
-            .underline_thickness = adjustThickness(thickness, adjustments.underline_thickness),
+            .underline_thickness = adjustThickness(deco_thickness, adjustments.underline_thickness),
             .strikethrough_position = strikethrough_position,
-            .strikethrough_thickness = adjustThickness(thickness, adjustments.strikethrough_thickness),
+            .strikethrough_thickness = adjustThickness(deco_thickness, adjustments.strikethrough_thickness),
             .overline_position = 0,
             .overline_thickness = adjustThickness(thickness, adjustments.overline_thickness),
             .cursor_height = natural_height,
