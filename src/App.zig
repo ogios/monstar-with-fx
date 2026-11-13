@@ -8148,10 +8148,10 @@ fn tabBarEqual(a: []const Renderer.TabBarItem, b: []const Renderer.TabBarItem) b
     return true;
 }
 
-fn tabBarMembershipChanged(a: []const Renderer.TabBarItem, b: []const Renderer.TabBarItem) bool {
+fn tabBarLabelsChanged(a: []const Renderer.TabBarItem, b: []const Renderer.TabBarItem) bool {
     if (a.len != b.len) return true;
     for (a, b) |x, y| {
-        if (x.id != y.id) return true;
+        if (x.id != y.id or !std.mem.eql(u8, x.title, y.title)) return true;
     }
     return false;
 }
@@ -8186,7 +8186,7 @@ fn updateTabBar(self: *App, now: u64) !bool {
                 null;
             if (geometry_changed or self.reduced_motion) {
                 self.tab_bar_transition.deinit(self.alloc);
-            } else if (tabBarMembershipChanged(self.async_job.tab_bar, items) or self.tab_bar_transition.frame(now) != null) {
+            } else if (tabBarLabelsChanged(self.async_job.tab_bar, items) or self.tab_bar_transition.frame(now) != null) {
                 const old = try Renderer.tabBarLabels(self.alloc, self.async_job.tab_bar, geometry.width, geometry.cell_width, geometry.cell_height);
                 defer self.alloc.free(old);
                 const new = try Renderer.tabBarLabels(self.alloc, items, geometry.width, geometry.cell_width, geometry.cell_height);
