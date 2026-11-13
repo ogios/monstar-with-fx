@@ -54,7 +54,7 @@ build() {
     --prefix /usr \
     --build-id=sha1 \
     -Doptimize=fast \
-    -Dcpu=baseline
+    -Dcpu=native
 }
 
 package() {
