@@ -41,6 +41,15 @@ pub fn blendRgb(fg: vt.color.RGB, bg: vt.color.RGB, alpha: u8) vt.color.RGB {
     };
 }
 
+/// Interpolate premultiplied ARGB bytes, including alpha, with a weight of 0–256.
+pub fn mixPremultiplied(foreground: u32, background: u32, weight: u16) u32 {
+    const mask: u32 = 0x00ff00ff;
+    const inverse: u16 = 256 - weight;
+    const rb = ((foreground & mask) * weight + (background & mask) * inverse + 0x00800080) >> 8 & mask;
+    const ag = ((foreground >> 8 & mask) * weight + (background >> 8 & mask) * inverse + 0x00800080) & ~mask;
+    return ag | rb;
+}
+
 pub fn premultipliedArgb(rgb: vt.color.RGB, alpha_u8: u8) u32 {
     const alpha: u32 = alpha_u8;
     const r = (@as(u32, rgb.r) * alpha + 127) / 255;

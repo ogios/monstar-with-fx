@@ -887,6 +887,13 @@ pub fn cancelRender(self: *Window, buffer: *Buffer) void {
     self.rendering_pending = false;
 }
 
+/// Cancel a render that may have overwritten the last committed pixels.
+pub fn discardRender(self: *Window, buffer: *Buffer) void {
+    self.cancelRender(buffer);
+    buffer.frame = 0;
+    if (self.newest_buffer == buffer) self.newest_buffer = null;
+}
+
 /// End the checkout for `buffer` and attempt to commit it to the surface. The
 /// caller must cancel instead if the window geometry changed since acquisition
 /// or the Window's current buffer format no longer matches `buffer.format`.

@@ -22,6 +22,7 @@ layout(set = 0, binding = 2) uniform sampler2D alpha_atlas;
 layout(set = 0, binding = 3) uniform sampler2D color_atlas;
 layout(set = 0, binding = 4) uniform sampler2D bgmap;
 layout(set = 0, binding = 5) uniform sampler2D images[32];
+layout(set = 0, binding = 6) uniform sampler2D tab_frames[2];
 
 layout(location = 0) flat in uvec4 v_a;
 layout(location = 1) flat in uvec4 v_b;
@@ -35,6 +36,7 @@ const uint KIND_COLOR = 2u;
 const uint KIND_COLOR_AS_TEXT = 3u;
 const uint KIND_IMAGE = 4u;
 const uint KIND_CAPSULE = 5u;
+const uint KIND_TAB_FADE = 6u;
 
 uvec4 bytes(vec4 v) {
     return uvec4(v * 255.0 + 0.5);
@@ -125,6 +127,28 @@ void main() {
     } else if (kind == KIND_IMAGE) {
         uvec4 t = bytes(texelFetch(images[nonuniformEXT(tex)], src, 0));
         emit(t.rgb, t.a);
+    } else if (kind == KIND_TAB_FADE) {
+        ivec2 local = p - origin;
+        int offset = int(v_a.z >> 16);
+        bool opening = tex == 1u;
+        ivec2 source = local + ivec2(0, opening ? -offset : offset);
+        uvec4 pixel;
+        if (opening) {
+            pixel = bytes(texelFetch(tab_frames[0], local, 0));
+            if (source.y >= 0) {
+                uvec4 incoming = bytes(texelFetch(tab_frames[1], source + origin, 0));
+                pixel = (incoming * color + pixel * (256u - color) + 128u) >> 8;
+            }
+        } else {
+            pixel = bytes(texelFetch(tab_frames[1], p, 0));
+            if (source.y < textureSize(tab_frames[0], 0).y) {
+                uvec4 outgoing = bytes(texelFetch(tab_frames[0], source, 0));
+                pixel = (outgoing * color + pixel * (256u - color) + 128u) >> 8;
+            }
+        }
+        // Both frames hold premultiplied sRGB bytes, including surface alpha.
+        out_color = vec4(lin(pixel.r), lin(pixel.g), lin(pixel.b), float(pixel.a) / 255.0);
+        out_weight = vec4(1.0);
     } else {
         // KIND_CAPSULE: pixel_raster.blendCapsule in single precision.
         float center_x = float(v_a.z & 0xffffu) * 0.5;

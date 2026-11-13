@@ -17,6 +17,7 @@ const Canvas = @import("Canvas.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Renderer = @import("Renderer.zig");
+const mixPremultiplied = @import("pixel_raster.zig").mixPremultiplied;
 const VulkanRenderer = @import("VulkanRenderer.zig");
 const tab_bar = @import("tab_bar.zig");
 
@@ -85,6 +86,7 @@ pub const Job = struct {
     tab_bar_colors: tab_bar.Colors = .{},
     /// Labels or active-tab styling changed independently of grid overlays.
     tab_bar_dirty: bool = false,
+    tab_content_transition: ?tab_bar.ContentTransition.Frame = null,
     /// Visible kitty placements, resolved on the main thread with image
     /// data repointed at cache-pinned copies; empty when no graphics are
     /// visible.
@@ -262,6 +264,8 @@ renderer: Renderer,
 /// Origin for converting the last job's grid damage to surface coordinates.
 rendered_grid_origin: [2]u31 = .{ 0, 0 },
 tab_bar_damage: ?Renderer.PixelRect = null,
+tab_pixels: std.ArrayList(u32) = .empty,
+tab_snapshot_id: ?u64 = null,
 thread: ?std.Thread,
 mutex: std.atomic.Mutex = .unlocked,
 job_fd: posix.fd_t,
@@ -340,6 +344,7 @@ pub fn deinit(self: *AsyncRaster) void {
     _ = linux.close(self.job_fd);
     _ = linux.close(self.complete_fd);
     self.renderer.deinit();
+    self.tab_pixels.deinit(self.alloc);
     self.font.deinit(self.alloc);
     self.alloc.destroy(self.font);
     self.* = undefined;
@@ -549,8 +554,16 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         std.debug.assert(job.stride >= job.width);
         std.debug.assert(job.pixels.len >= @as(usize, job.stride) * job.height);
         self.renderer.buffer_stride = job.stride;
-        return self.renderJobOn(job, .cpu(job.pixels, job.stride, job.width, job.height), damage);
+        self.prepareTabSnapshot(job);
+        try self.renderJobOn(job, .cpu(job.pixels, job.stride, job.width, job.height), damage);
+        if (job.tab_content_transition) |frame| {
+            if (self.tab_pixels.items.len != 0) {
+                compositeTabTransition(job.pixels, job.stride, self.tab_pixels.items, frame);
+            }
+        }
+        return;
     };
+    self.prepareTabSnapshot(job);
     const list = try gpu.beginFrame(job.width, job.height, self.font_id);
     errdefer gpu.cancelFrame();
     const canvas: Canvas = .gpu(list, job.width, job.height);
@@ -564,7 +577,115 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         },
         else => |e| return e,
     };
-    try gpu.submitFrame();
+    try gpu.submitFrame(job.tab_content_transition);
+}
+
+fn prepareTabSnapshot(self: *AsyncRaster, job: Job) void {
+    const frame = if (job.gpu == null) job.tab_content_transition else null;
+    const id = if (frame) |slide| slide.id else null;
+    if (self.tab_snapshot_id == id) return;
+    self.tab_snapshot_id = id;
+    const slide = frame orelse {
+        self.tab_pixels.clearAndFree(self.alloc);
+        return;
+    };
+
+    // The latest committed buffer can alias the destination. Retain its
+    // terminal pixels before the incoming frame overwrites them.
+    self.tab_pixels.clearRetainingCapacity();
+    const source = job.source_pixels orelse return;
+    self.tab_pixels.resize(self.alloc, @as(usize, slide.width) * slide.height) catch return;
+    for (0..slide.height) |y| {
+        const src = (slide.top + y) * job.stride;
+        Renderer.copyPixels(self.tab_pixels.items[y * slide.width ..][0..slide.width], source[src..][0..slide.width]);
+    }
+}
+
+fn compositeTabTransition(pixels: []u32, stride: u31, outgoing: []const u32, frame: tab_bar.ContentTransition.Frame) void {
+    switch (frame.effect) {
+        .slide => {
+            const old = frame.outgoing();
+            const new = frame.incoming();
+            for (0..frame.height) |y| {
+                const row = pixels[(frame.top + y) * stride ..][0..frame.width];
+                @memmove(row[new.dst_x..][0..new.width], row[new.src_x..][0..new.width]);
+                Renderer.copyPixels(row[old.dst_x..][0..old.width], outgoing[y * frame.width + old.src_x ..][0..old.width]);
+            }
+        },
+        .fade => |fade| switch (fade.foreground) {
+            .incoming => {
+                // Read the translated incoming row before overwriting it.
+                var y: usize = frame.height;
+                while (y > fade.offset) {
+                    y -= 1;
+                    const row = pixels[(frame.top + y) * stride ..][0..frame.width];
+                    const source = pixels[(frame.top + y - fade.offset) * stride ..][0..frame.width];
+                    const previous = outgoing[y * frame.width ..][0..frame.width];
+                    for (row, source, previous) |*dst, foreground, background| {
+                        dst.* = mixPremultiplied(foreground, background, fade.opacity);
+                    }
+                }
+                for (0..fade.offset) |row_y| {
+                    const row = pixels[(frame.top + row_y) * stride ..][0..frame.width];
+                    Renderer.copyPixels(row, outgoing[row_y * frame.width ..][0..frame.width]);
+                }
+            },
+            .outgoing => {
+                for (0..frame.height - fade.offset) |y| {
+                    const row = pixels[(frame.top + y) * stride ..][0..frame.width];
+                    const source = outgoing[(y + fade.offset) * frame.width ..][0..frame.width];
+                    for (row, source) |*dst, foreground| dst.* = mixPremultiplied(foreground, dst.*, fade.opacity);
+                }
+            },
+        },
+    }
+}
+
+test "tab slide composites overlapping spans without changing the tab bar or stride padding" {
+    const frame: tab_bar.ContentTransition.Frame = .{ .id = 1, .width = 4, .top = 1, .height = 1, .effect = .{ .slide = .{ .direction = .left, .outgoing_width = 1 } } };
+    const incoming = [_]u32{ 9, 9, 9, 9, 0, 1, 2, 3, 4, 0 };
+    const outgoing = [_]u32{ 5, 6, 7, 8 };
+    var pixels = incoming;
+    compositeTabTransition(&pixels, 5, &outgoing, frame);
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9, 9, 9, 0, 8, 1, 2, 3, 0 }, &pixels);
+
+    var reversed = frame;
+    reversed.effect.slide.direction = .right;
+    pixels = incoming;
+    compositeTabTransition(&pixels, 5, &outgoing, reversed);
+    try std.testing.expectEqualSlices(u32, &.{ 9, 9, 9, 9, 0, 2, 3, 4, 5, 0 }, &pixels);
+}
+
+test "vertical tab fades blend over the stationary page and preserve the strip" {
+    const initial = [_]u32{
+        0x88776655, 0x88776655, 0,
+        0x80402010, 0x80201008, 0,
+        0xc0804020, 0xc030180c, 0,
+    };
+    const outgoing = [_]u32{ 0x40080402, 0x400c0604, 0x60301808, 0x60201008 };
+    var frame: tab_bar.ContentTransition.Frame = .{
+        .id = 1,
+        .width = 2,
+        .top = 1,
+        .height = 2,
+        .effect = .{ .fade = .{ .foreground = .incoming, .offset = 1, .opacity = 128 } },
+    };
+    var pixels = initial;
+    compositeTabTransition(&pixels, 3, &outgoing, frame);
+    try std.testing.expectEqualSlices(u32, &.{
+        0x88776655, 0x88776655, 0,
+        0x40080402, 0x400c0604, 0,
+        0x70381c0c, 0x70201008, 0,
+    }, &pixels);
+
+    pixels = initial;
+    frame.effect.fade.foreground = .outgoing;
+    compositeTabTransition(&pixels, 3, &outgoing, frame);
+    try std.testing.expectEqualSlices(u32, &.{
+        0x88776655, 0x88776655, 0,
+        0x70381c0c, 0x70201008, 0,
+        0xc0804020, 0xc030180c, 0,
+    }, &pixels);
 }
 
 fn renderJobOn(self: *AsyncRaster, job: Job, canvas: Canvas, damage: *Damage) !void {

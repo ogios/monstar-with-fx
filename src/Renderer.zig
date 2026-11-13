@@ -1378,12 +1378,18 @@ pub fn drawTabBar(
     const layout: TabLayout = try .init(self.alloc, items, canvas.width, cell_w, cell_h);
     defer self.alloc.free(layout.cells);
 
-    const visible = highlight orelse layout.activeHighlight();
-    if (visible) |bounds| try drawTabHighlight(canvas, bounds, row_top, row_height, colors.active_background, background);
+    const highlighted_label = if (transition) |frame| frame.highlightIndex() else null;
+    const visible = if (highlighted_label) |i| transition.?.labelAt(i).bounds else highlight orelse layout.activeHighlight();
+    const highlight_opacity = if (highlighted_label) |i| transition.?.labelOpacity(i) else 255;
+    if (visible) |bounds| {
+        const color = blendRgb(colors.active_background, colors.background, highlight_opacity);
+        const alpha: u8 = self.background_alpha + @as(u8, @intCast((@as(u32, 255 - self.background_alpha) * highlight_opacity) / 255));
+        try drawTabHighlight(canvas, bounds, row_top, row_height, color, alpha, background);
+    }
     const baseline_y = @as(i32, row_top) + self.font.baseline - @as(i32, (cell_h - row_height) / 2);
     if (transition) |frame| {
         for (0..frame.tracks.len) |i| {
-            try self.drawTabLabel(canvas, frame.labelAt(i), frame.labelWidth(i), baseline_y, colors, visible);
+            try self.drawTabLabel(canvas, frame.labelAt(i), frame.labelWidth(i), baseline_y, colors, visible, frame.labelOpacity(i));
         }
         return;
     }
@@ -1391,7 +1397,7 @@ pub fn drawTabBar(
     for (items, 1..) |item, index| {
         const box = boxes.next() orelse break;
         const label: tab_bar.Label = .{ .id = item.id, .index = index, .title = item.title, .bounds = box };
-        try self.drawTabLabel(canvas, label, box.right - box.left, baseline_y, colors, visible);
+        try self.drawTabLabel(canvas, label, box.right - box.left, baseline_y, colors, visible, 255);
     }
 }
 
@@ -1403,14 +1409,24 @@ fn drawTabLabel(
     baseline_y: i32,
     colors: tab_bar.Colors,
     highlight: ?tab_bar.Highlight,
+    opacity: u8,
 ) !void {
     const left = label.bounds.left;
     const right = @min(label.bounds.right, canvas.width);
-    if (left >= right) return;
+    if (left >= right or opacity == 0) return;
     const view = canvas.view(left, 0, right - left, canvas.height);
     const visible: ?tab_bar.Highlight = if (highlight) |bounds| .{ .left = bounds.left -| left, .right = bounds.right -| left } else null;
-    const title_colors: TabTitleColors = .{ .active = colors.active_title, .inactive = colors.inactive_title, .highlight = visible };
-    const index_colors: TabTitleColors = .{ .active = colors.active_index, .inactive = colors.inactive_index, .highlight = visible };
+    const active_bg = blendRgb(colors.active_background, colors.background, opacity);
+    const title_colors: TabTitleColors = .{
+        .active = blendRgb(colors.active_title, active_bg, opacity),
+        .inactive = blendRgb(colors.inactive_title, colors.background, opacity),
+        .highlight = visible,
+    };
+    const index_colors: TabTitleColors = .{
+        .active = blendRgb(colors.active_index, active_bg, opacity),
+        .inactive = blendRgb(colors.inactive_index, colors.background, opacity),
+        .highlight = visible,
+    };
     const cell_w = self.font.cell_width;
     const box_cells = layout_width / cell_w;
     var digits: [20]u8 = undefined;
@@ -1441,12 +1457,13 @@ fn drawTabHighlight(
     top: u31,
     height: u31,
     color: vt.color.RGB,
+    opacity: u8,
     background: u32,
 ) !void {
     const right = @min(bounds.right, canvas.width);
     if (right <= bounds.left) return;
     const width = right - bounds.left;
-    const fill = argb(color);
+    const fill = pixel_raster.premultipliedArgb(color, opacity);
     const corner_rows = @min(height / 2, @as(u31, @intCast((@as(u64, height) * 231 + 529) / 530)));
     try canvas.fillRect(bounds.left, top + corner_rows, width, height - 2 * corner_rows, fill);
 
@@ -1471,7 +1488,10 @@ fn drawTabHighlight(
             }
             const alpha: u8 = @intFromFloat(@round(coverage * (255.0 / 4.0)));
             if (alpha == 255) break;
-            const pixel = blendPixel(background, &.{ color.r, color.g, color.b, alpha });
+            const pixel = if (opacity == 255)
+                blendPixel(background, &.{ color.r, color.g, color.b, alpha })
+            else
+                pixel_raster.mixPremultiplied(fill, background, @intCast((@as(u32, alpha) * 256 + 127) / 255));
             try canvas.fillRect(bounds.left + inset, y, 1, 1, pixel);
             try canvas.fillRect(right - 1 - inset, y, 1, 1, pixel);
             try canvas.fillRect(bounds.left + inset, opposite, 1, 1, pixel);

@@ -25,6 +25,7 @@ const vk = @import("vk");
 const Dispatch = @import("VulkanDispatch.zig");
 const GpuDrawList = @import("GpuDrawList.zig");
 const pixel_raster = @import("pixel_raster.zig");
+const ContentTransition = @import("tab_bar.zig").ContentTransition;
 
 const log = std.log.scoped(.vulkan);
 const check = Dispatch.check;
@@ -35,6 +36,7 @@ const slot_count = 2;
 /// Frames whose GPU timestamps stay readable: telemetry reads a frame's
 /// queries when the compositor reports it presented, a few frames later.
 const timed_frames = 16;
+const fragment_sampler_count = 5 + GpuDrawList.max_images;
 const vert_spv align(4) = @embedFile("shaders/canvas.vert.spv").*;
 const frag_spv align(4) = @embedFile("shaders/canvas.frag.spv").*;
 
@@ -74,6 +76,7 @@ const Garbage = struct {
 const Slot = struct {
     cmd: vk.VkCommandBuffer = null,
     set: vk.VkDescriptorSet = null,
+    fade_set: vk.VkDescriptorSet = null,
     ops: Buffer = .{},
     staging: Buffer = .{},
     done_value: u64 = 0,
@@ -124,6 +127,8 @@ color_atlas: Image = .{},
 images: [GpuDrawList.max_images]Image = @splat(.{}),
 canvases: [2]Image = @splat(.{}),
 bgmaps: [2]Image = @splat(.{}),
+tab_snapshot: Image = .{},
+tab_snapshot_id: ?u64 = null,
 current: u1 = 0,
 canvas_valid: bool = false,
 font_id: u64 = 0,
@@ -172,6 +177,7 @@ pub fn destroy(self: *VulkanRenderer) void {
         }
         for (self.images) |image| self.destroyImage(image);
         for (self.canvases ++ self.bgmaps) |image| self.destroyImage(image);
+        self.destroyImage(self.tab_snapshot);
         self.destroyImage(self.alpha_atlas);
         self.destroyImage(self.color_atlas);
         self.destroyImage(self.dummy);
@@ -230,6 +236,8 @@ fn createDevice(self: *VulkanRenderer) !void {
         var props: vk.VkPhysicalDeviceProperties = undefined;
         d.vkGetPhysicalDeviceProperties(physical, &props);
         if (props.apiVersion < vk.VK_API_VERSION_1_3) continue;
+        if (props.limits.maxPerStageDescriptorSamplers < fragment_sampler_count or
+            props.limits.maxPerStageDescriptorSampledImages < fragment_sampler_count) continue;
         var family_count: u32 = 0;
         d.vkGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, null);
         var families: [16]vk.VkQueueFamilyProperties = undefined;
@@ -333,6 +341,7 @@ fn createPipeline(self: *VulkanRenderer) !void {
         .{ .binding = 3, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = frag },
         .{ .binding = 4, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = frag },
         .{ .binding = 5, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = GpuDrawList.max_images, .stageFlags = frag },
+        .{ .binding = 6, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 2, .stageFlags = frag },
     };
     const layout_info: vk.VkDescriptorSetLayoutCreateInfo = .{
         .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -452,29 +461,31 @@ fn createStaticResources(self: *VulkanRenderer) !void {
     };
     try check(d.vkAllocateCommandBuffers(self.device, &cmd_info, &cmds));
 
+    const set_count = 2 * slot_count;
     const sizes = [_]vk.VkDescriptorPoolSize{
-        .{ .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 * slot_count },
-        .{ .type = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = (3 + GpuDrawList.max_images) * slot_count },
+        .{ .type = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 * set_count },
+        .{ .type = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = fragment_sampler_count * set_count },
     };
     const desc_pool_info: vk.VkDescriptorPoolCreateInfo = .{
         .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = slot_count,
+        .maxSets = set_count,
         .poolSizeCount = sizes.len,
         .pPoolSizes = &sizes,
     };
     try check(d.vkCreateDescriptorPool(self.device, &desc_pool_info, null, &self.descriptor_pool));
-    const layouts: [slot_count]vk.VkDescriptorSetLayout = @splat(self.set_layout);
-    var sets: [slot_count]vk.VkDescriptorSet = undefined;
+    const layouts: [set_count]vk.VkDescriptorSetLayout = @splat(self.set_layout);
+    var sets: [set_count]vk.VkDescriptorSet = undefined;
     const set_info: vk.VkDescriptorSetAllocateInfo = .{
         .sType = vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = self.descriptor_pool,
-        .descriptorSetCount = slot_count,
+        .descriptorSetCount = layouts.len,
         .pSetLayouts = &layouts,
     };
     try check(d.vkAllocateDescriptorSets(self.device, &set_info, &sets));
-    for (&self.slots, cmds, sets) |*slot, cmd, set| {
+    for (&self.slots, cmds, sets[0..slot_count], sets[slot_count..]) |*slot, cmd, set, fade_set| {
         slot.cmd = cmd;
         slot.set = set;
+        slot.fade_set = fade_set;
     }
 
     if (self.timestamps_supported) {
@@ -744,7 +755,7 @@ pub fn beginFrame(self: *VulkanRenderer, width: u31, height: u31, font_id: u64) 
         }
         const usage = vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         for (&self.canvases, &self.bgmaps) |*canvas, *bgmap| {
-            canvas.* = try self.createImage(width, height, canvas_format, usage, false);
+            canvas.* = try self.createImage(width, height, canvas_format, usage | vk.VK_IMAGE_USAGE_SAMPLED_BIT, true);
             bgmap.* = try self.createImage(width, height, canvas_format, usage | vk.VK_IMAGE_USAGE_SAMPLED_BIT, true);
         }
         self.canvas_valid = false;
@@ -801,8 +812,8 @@ pub fn frameGpuNs(self: *VulkanRenderer, seq: u64) ?u64 {
     return @intFromFloat(@as(f64, @floatFromInt(ticks)) * self.timestamp_period);
 }
 
-/// Rasterize the recorded frame into the canvas.
-pub fn submitFrame(self: *VulkanRenderer) !void {
+/// Rasterize the recorded frame. Tab transitions must repaint the full canvas.
+pub fn submitFrame(self: *VulkanRenderer, transition: ?ContentTransition.Frame) !void {
     const list = &self.list;
     if (list.ops.items.len == 0 and list.scroll == null and list.glyph_uploads.items.len == 0 and
         list.image_uploads.items.len == 0) return;
@@ -812,6 +823,25 @@ pub fn submitFrame(self: *VulkanRenderer) !void {
     try self.waitValue(slot.done_value);
     self.readTimestamps(slot);
     self.collectGarbage();
+    if (transition == null and self.tab_snapshot.image != null) {
+        try self.retire(.{ .image = self.tab_snapshot });
+        self.tab_snapshot = .{};
+        self.tab_snapshot_id = null;
+    }
+    const capture_tab = if (transition) |frame| self.tab_snapshot_id != frame.id else false;
+    if (capture_tab) {
+        const frame = transition.?;
+        std.debug.assert(self.canvas_valid and list.scroll == null);
+        if (self.tab_snapshot.width != frame.width or self.tab_snapshot.height != frame.height) {
+            if (self.tab_snapshot.image != null) try self.retire(.{ .image = self.tab_snapshot });
+            self.tab_snapshot = .{};
+            const usage = vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT | vk.VK_IMAGE_USAGE_SAMPLED_BIT;
+            self.tab_snapshot = try self.createImage(frame.width, frame.height, canvas_format, usage, true);
+        }
+    }
+    const raster_ops = list.ops.items.len;
+    const has_fade = if (transition) |frame| frame.effect == .fade else false;
+    if (has_fade) try list.tabFade(transition.?, transition.?.effect.fade);
 
     var new_images: std.ArrayList(vk.VkImage) = .empty;
     defer new_images.deinit(self.alloc);
@@ -859,7 +889,9 @@ pub fn submitFrame(self: *VulkanRenderer) !void {
     if (upload_bytes.len > 0) @memcpy(slot.staging.mapped[0..upload_bytes.len], upload_bytes);
 
     if (list.scroll != null) self.current ^= 1;
-    self.updateDescriptors(slot);
+    self.updateDescriptors(slot, slot.set, false);
+    // Bind the incoming canvas as a sampled image only after rasterizing it.
+    if (has_fade) self.updateDescriptors(slot, slot.fade_set, true);
 
     const cmd = slot.cmd;
     try check(d.vkResetCommandBuffer(cmd, 0));
@@ -879,11 +911,15 @@ pub fn submitFrame(self: *VulkanRenderer) !void {
     // GENERAL afterwards, ordered by full memory barriers below.
     var transitions: std.ArrayList(vk.VkImageMemoryBarrier2) = .empty;
     defer transitions.deinit(self.alloc);
-    const all_images = [_]*Image{ &self.alpha_atlas, &self.color_atlas, &self.dummy } ++ ptrs(&self.canvases) ++ ptrs(&self.bgmaps);
+    const all_images = [_]*Image{ &self.alpha_atlas, &self.color_atlas, &self.dummy, &self.tab_snapshot } ++ ptrs(&self.canvases) ++ ptrs(&self.bgmaps);
     for (all_images) |image| try self.noteNewImage(&transitions, image);
     for (&self.images) |*image| try self.noteNewImage(&transitions, image);
     self.barrier(cmd, transitions.items);
 
+    if (capture_tab) {
+        const frame = transition.?;
+        self.copySlideSpan(cmd, self.canvases[self.current].image, self.tab_snapshot.image, .{ .src_x = 0, .dst_x = 0, .width = frame.width }, frame.top, 0, frame.height);
+    }
     for (atlas_copies) |maybe| {
         const copy = maybe orelse continue;
         const region: vk.VkImageCopy = .{
@@ -937,13 +973,14 @@ pub fn submitFrame(self: *VulkanRenderer) !void {
     });
     if (!bounds.isEmpty()) {
         if (list.bg_ops.items.len > 0) {
-            self.draw(cmd, slot, self.bgmaps[self.current].view, bounds, 0, list.bg_ops.items.len);
+            self.draw(cmd, slot.set, self.bgmaps[self.current].view, bounds, 0, list.bg_ops.items.len);
             self.barrier(cmd, &.{});
         }
-        if (list.ops.items.len > 0) {
-            self.draw(cmd, slot, self.canvases[self.current].view, bounds, list.bg_ops.items.len, list.ops.items.len);
+        if (raster_ops > 0) {
+            self.draw(cmd, slot.set, self.canvases[self.current].view, bounds, list.bg_ops.items.len, raster_ops);
         }
     }
+    if (transition) |frame| self.compositeTabTransition(cmd, slot.fade_set, frame, list.bg_ops.items.len + raster_ops);
     if (self.query_pool != null) {
         d.vkCmdWriteTimestamp2(cmd, vk.VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, self.query_pool, query_base + 1);
         slot.timed_seq = seq;
@@ -965,7 +1002,50 @@ pub fn submitFrame(self: *VulkanRenderer) !void {
     @atomicStore(u64, &self.frame_seq, seq, .release);
     self.slot_index = (self.slot_index + 1) % slot_count;
     self.canvas_valid = true;
+    self.tab_snapshot_id = if (transition) |frame| frame.id else null;
     self.stats.ops += list.ops.items.len;
+}
+
+fn compositeTabTransition(self: *VulkanRenderer, cmd: vk.VkCommandBuffer, fade_set: vk.VkDescriptorSet, frame: ContentTransition.Frame, fade_op: usize) void {
+    const incoming = self.canvases[self.current];
+    self.current ^= 1;
+    const target = self.canvases[self.current];
+    self.barrier(cmd, &.{});
+    if (frame.effect == .fade) {
+        const bounds: GpuDrawList.Rect = .{ .x0 = 0, .y0 = frame.top, .x1 = frame.width, .y1 = frame.top + frame.height };
+        self.draw(cmd, fade_set, target.view, bounds, fade_op, 1);
+        self.barrier(cmd, &.{});
+    } else {
+        self.copySlideSpan(cmd, incoming.image, target.image, frame.incoming(), frame.top, frame.top, frame.height);
+        self.copySlideSpan(cmd, self.tab_snapshot.image, target.image, frame.outgoing(), 0, frame.top, frame.height);
+    }
+
+    // Preserve the freshly drawn tab strip at its original coordinates.
+    const full: ContentTransition.Frame.Span = .{ .src_x = 0, .dst_x = 0, .width = frame.width };
+    const bottom = frame.top + frame.height;
+    self.copySlideSpan(cmd, incoming.image, target.image, full, 0, 0, frame.top);
+    self.copySlideSpan(cmd, incoming.image, target.image, full, bottom, bottom, @as(u31, @intCast(incoming.height)) - bottom);
+}
+
+fn copySlideSpan(
+    self: *VulkanRenderer,
+    cmd: vk.VkCommandBuffer,
+    src: vk.VkImage,
+    dst: vk.VkImage,
+    span: ContentTransition.Frame.Span,
+    src_y: u31,
+    dst_y: u31,
+    height: u31,
+) void {
+    if (span.width == 0 or height == 0) return;
+    const region: vk.VkImageCopy = .{
+        .srcSubresource = color_layers,
+        .srcOffset = .{ .x = span.src_x, .y = src_y, .z = 0 },
+        .dstSubresource = color_layers,
+        .dstOffset = .{ .x = span.dst_x, .y = dst_y, .z = 0 },
+        .extent = .{ .width = span.width, .height = height, .depth = 1 },
+    };
+    self.d.vkCmdCopyImage(cmd, src, vk.VK_IMAGE_LAYOUT_GENERAL, dst, vk.VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
 fn ptrs(images: *[2]Image) [2]*Image {
@@ -1011,7 +1091,7 @@ pub fn barrier(self: *VulkanRenderer, cmd: vk.VkCommandBuffer, images: []const v
 fn draw(
     self: *VulkanRenderer,
     cmd: vk.VkCommandBuffer,
-    slot: *const Slot,
+    set: vk.VkDescriptorSet,
     target: vk.VkImageView,
     bounds: GpuDrawList.Rect,
     base: usize,
@@ -1040,7 +1120,7 @@ fn draw(
     };
     d.vkCmdBeginRendering(cmd, &rendering);
     d.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
-    d.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline_layout, 0, 1, &slot.set, 0, null);
+    d.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline_layout, 0, 1, &set, 0, null);
     const viewport: vk.VkViewport = .{
         .x = 0,
         .y = 0,
@@ -1060,7 +1140,7 @@ fn draw(
     d.vkCmdEndRendering(cmd);
 }
 
-fn updateDescriptors(self: *VulkanRenderer, slot: *const Slot) void {
+fn updateDescriptors(self: *VulkanRenderer, slot: *const Slot, set: vk.VkDescriptorSet, has_fade: bool) void {
     const ops_info: vk.VkDescriptorBufferInfo = .{ .buffer = slot.ops.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
     const tables_info: vk.VkDescriptorBufferInfo = .{ .buffer = self.tables.buffer, .offset = 0, .range = vk.VK_WHOLE_SIZE };
     const image_info = struct {
@@ -1075,8 +1155,12 @@ fn updateDescriptors(self: *VulkanRenderer, slot: *const Slot) void {
     for (&images, self.images) |*info, image| {
         info.* = image_info(self.sampler, if (image.view != null) image.view else self.dummy.view);
     }
-    const base: vk.VkWriteDescriptorSet = .{ .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = slot.set, .descriptorCount = 1 };
-    var writes: [6]vk.VkWriteDescriptorSet = @splat(base);
+    const tab_frames = [_]vk.VkDescriptorImageInfo{
+        image_info(self.sampler, if (has_fade) self.tab_snapshot.raw_view else self.dummy.view),
+        image_info(self.sampler, if (has_fade) self.canvases[self.current].raw_view else self.dummy.view),
+    };
+    const base: vk.VkWriteDescriptorSet = .{ .sType = vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .descriptorCount = 1 };
+    var writes: [7]vk.VkWriteDescriptorSet = @splat(base);
     writes[0].dstBinding = 0;
     writes[0].descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[0].pBufferInfo = &ops_info;
@@ -1092,6 +1176,10 @@ fn updateDescriptors(self: *VulkanRenderer, slot: *const Slot) void {
     writes[5].descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[5].descriptorCount = GpuDrawList.max_images;
     writes[5].pImageInfo = &images;
+    writes[6].dstBinding = 6;
+    writes[6].descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[6].descriptorCount = tab_frames.len;
+    writes[6].pImageInfo = &tab_frames;
     self.d.vkUpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
 }
 

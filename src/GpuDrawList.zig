@@ -16,6 +16,7 @@ const GpuDrawList = @This();
 const std = @import("std");
 const Font = @import("Font.zig");
 const pixel_raster = @import("pixel_raster.zig");
+const ContentTransition = @import("tab_bar.zig").ContentTransition;
 
 pub const Rect = struct {
     x0: i32,
@@ -57,6 +58,8 @@ pub const Kind = enum(u16) {
     image = 4,
     /// Antialiased scrollbar capsule.
     capsule = 5,
+    /// Mix the saved and freshly rendered terminal images.
+    tab_fade = 6,
 };
 
 pub const GlyphKind = enum { text, color, color_as_text };
@@ -67,14 +70,14 @@ pub const Op = extern struct {
     y0: i16,
     x1: i16,
     y1: i16,
-    /// Source texel under (x0, y0): atlas or image coordinates. Capsules
-    /// store twice their center x and their diameter instead.
+    /// Source texel under (x0, y0). Capsules store twice their center x and
+    /// their diameter. Tab fades store vertical displacement in sy.
     sx: u16,
     sy: u16,
     kind: Kind,
-    /// Image slot, or capsule alpha.
+    /// Image slot, capsule alpha, or 1 for an incoming tab fade.
     tex: u16,
-    /// ARGB8888; premultiplied for fills.
+    /// ARGB8888, premultiplied for fills, or the tab fade weight.
     color: u32,
     /// Capsule cap centers (top, bottom) in surface pixels.
     p0: f32 = 0,
@@ -346,6 +349,13 @@ pub fn image(self: *GpuDrawList, r: Rect, slot: u16, texel_x: u32, texel_y: u32,
     op.sy = @intCast(texel_y);
     op.tex = slot;
     try self.push(op, background);
+}
+
+pub fn tabFade(self: *GpuDrawList, frame: ContentTransition.Frame, fade: ContentTransition.Frame.Fade) !void {
+    var op = baseOp(.{ .x0 = 0, .y0 = frame.top, .x1 = frame.width, .y1 = frame.top + frame.height }, .tab_fade, fade.opacity);
+    op.sy = @intCast(fade.offset);
+    op.tex = @intFromBool(fade.foreground == .incoming);
+    try self.push(op, false);
 }
 
 /// The slot already holding `key`, marked as used by this frame.

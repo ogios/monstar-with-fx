@@ -155,6 +155,7 @@ tab_bar_transition: tab_bar.Transition = .{},
 tab_bar_geometry: ?TabBarGeometry = null,
 tab_bar_highlight: ?tab_bar.Highlight = null,
 tab_bar_animating: bool = false,
+tab_content_transition: ?tab_bar.ContentTransition = null,
 /// Selection highlight colors, from config or OSC 17/19. Snapshotted
 /// into the raster worker's renderer on (re)configure.
 selection_bg: vt.color.RGB,
@@ -1760,6 +1761,10 @@ fn setColorScheme(self: *App, color_scheme: vt.device_status.ColorScheme, report
 fn setReducedMotion(self: *App, reduced_motion: bool) void {
     if (self.reduced_motion == reduced_motion) return;
     self.reduced_motion = reduced_motion;
+    if (reduced_motion) {
+        self.cancelTabContentTransition();
+        if (self.tab_bar_animating) self.requestFullAsyncRedraw();
+    }
     if (reduced_motion and self.scrollbar_fading) {
         self.hideScrollbar();
         self.syncHoveredLink(true);
@@ -2334,13 +2339,7 @@ fn removeExitedTab(self: *App, idx: usize) bool {
         return true;
     }
 
-    if (self.tabs.items[idx] == self.active) {
-        if (idx + 1 < self.tabs.items.len) {
-            self.activateIndex(idx + 1);
-        } else {
-            self.activateIndex(idx - 1);
-        }
-    }
+    self.activateNeighborBeforeClose(idx);
     self.endOwnedKittyDrag(self.tabs.items[idx]);
     const closing = self.tabs.orderedRemove(idx);
     self.disposeClosedTab(closing);
@@ -2526,10 +2525,14 @@ fn newTab(self: *App) void {
     };
     if (tb.term.getTitle()) |title| self.window.toplevel.setTitle(title.ptr);
     log.debug("opened new tab ({d})", .{self.tabs.items.len});
-    self.activateTab(tb);
+    self.activateTab(tb, .open);
 }
 
-fn activateTab(self: *App, tb: *Tab) void {
+fn activateIndex(self: *App, index: usize) void {
+    self.activateTab(self.tabs.items[index], .{ .slide = if (index > self.activeIndex()) .left else .right });
+}
+
+fn activateTab(self: *App, tb: *Tab, kind: tab_bar.ContentTransition.Kind) void {
     if (tb == self.active) return;
     self.endOwnedKittyDrag(self.active);
     self.resetSmoothScroll();
@@ -2541,11 +2544,6 @@ fn activateTab(self: *App, tb: *Tab) void {
     self.clearImeText();
     self.active = tb;
     self.resetCursorAnimator();
-    // Every tab shares the window geometry; make sure the newly-active
-    // terminal matches the current grid and force a full repaint.
-    self.render_state.rows = 0;
-    self.render_state.dirty = .full;
-    self.async_force_full = true;
     self.hovered_link = null;
     self.link_checked_cell = null;
     self.link_active = false;
@@ -2554,11 +2552,28 @@ fn activateTab(self: *App, tb: *Tab) void {
     self.syncSynchronizedOutput(tb);
     self.syncInBandSizeReports(tb);
     self.requestFullAsyncRedraw();
+    self.tab_content_transition = if (self.reduced_motion or self.window.suspended)
+        null
+    else
+        .{
+            .id = self.async_generation,
+            .kind = kind,
+            .vertical_travel = Window.physicalDimension(48, self.window.scale120),
+        };
     if (tb.term.getTitle()) |title| self.window.toplevel.setTitle(title.ptr);
 }
 
-fn activateIndex(self: *App, index: usize) void {
-    self.activateTab(self.tabs.items[index]);
+fn activateNeighborBeforeClose(self: *App, index: usize) void {
+    std.debug.assert(self.tabs.items.len > 1);
+    if (self.tabs.items[index] != self.active) return;
+    const neighbor = if (index + 1 < self.tabs.items.len) index + 1 else index - 1;
+    self.activateTab(self.tabs.items[neighbor], .close);
+}
+
+fn cancelTabContentTransition(self: *App) void {
+    if (self.tab_content_transition == null) return;
+    self.tab_content_transition = null;
+    self.requestFullAsyncRedraw();
 }
 
 /// Returns a live tab by its stable asynchronous-operation identity.
@@ -2610,13 +2625,7 @@ fn closeTabAt(self: *App, idx: usize) void {
         log.warn("cannot close tab: failed to reserve child cleanup ({})", .{err});
         return;
     };
-    if (self.tabs.items[idx] == self.active) {
-        if (idx + 1 < self.tabs.items.len) {
-            self.activateIndex(idx + 1);
-        } else {
-            self.activateIndex(idx - 1);
-        }
-    }
+    self.activateNeighborBeforeClose(idx);
     self.endOwnedKittyDrag(self.tabs.items[idx]);
     const closing = self.tabs.orderedRemove(idx);
     // Stop the child immediately. Only cache/terminal destruction may wait
@@ -3254,6 +3263,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
     );
 
     self.applyColorDefaultsForConfig(new_config);
+    self.tab_content_transition = null;
     self.window.setBufferAlpha(new_config.background_opacity < 255);
     self.window.setBackgroundBlur(new_config.requestsBackgroundBlur());
     self.window.toplevel.setAppId(new_config.app_id);
@@ -8179,11 +8189,17 @@ fn updateTabBar(self: *App, now: u64) !bool {
         const items = try self.tabBarSnapshot();
         defer self.freeTabBarSnapshot(items);
         items_changed = !tabBarEqual(self.async_job.tab_bar, items);
-        if (geometry_changed or items_changed) {
+        if (geometry_changed or items_changed or (self.reduced_motion and self.tab_bar_animating)) {
             const target = if (geometry.height > 0)
                 try Renderer.tabBarActiveHighlight(self.alloc, items, geometry.width, geometry.cell_width, geometry.cell_height)
             else
                 null;
+            const membership: tab_bar.Transition.Membership = if (items.len > self.async_job.tab_bar.len)
+                .opened
+            else if (items.len < self.async_job.tab_bar.len)
+                .closed
+            else
+                .unchanged;
             if (geometry_changed or self.reduced_motion) {
                 self.tab_bar_transition.deinit(self.alloc);
             } else if (tabBarLabelsChanged(self.async_job.tab_bar, items) or self.tab_bar_transition.frame(now) != null) {
@@ -8191,16 +8207,19 @@ fn updateTabBar(self: *App, now: u64) !bool {
                 defer self.alloc.free(old);
                 const new = try Renderer.tabBarLabels(self.alloc, items, geometry.width, geometry.cell_width, geometry.cell_height);
                 defer self.alloc.free(new);
-                try self.tab_bar_transition.retarget(self.alloc, now, old, new);
+                try self.tab_bar_transition.retarget(self.alloc, now, old, new, membership, self.active.id, self.tab_bar_animation.active_id);
             }
             if (items_changed) try self.async_job.replaceTabBar(self.alloc, items);
-            self.tab_bar_animation.retarget(now, self.active.id, target, geometry_changed or self.reduced_motion, self.tab_bar_transition.frame(now) != null);
+            const transition = self.tab_bar_transition.frame(now);
+            const highlight_follows_label = if (transition) |frame| frame.highlightIndex() != null else false;
+            self.tab_bar_animation.retarget(now, self.active.id, target, geometry_changed or self.reduced_motion or highlight_follows_label, transition != null);
             self.tab_bar_geometry = geometry;
         }
     }
+    const frame = self.tab_bar_transition.frame(now);
     const highlight = self.tab_bar_animation.bounds(now);
     const was_animating = self.tab_bar_animating;
-    const transition_active = self.tab_bar_transition.frame(now) != null;
+    const transition_active = frame != null;
     if (!transition_active) self.tab_bar_transition.deinit(self.alloc);
     self.tab_bar_animating = self.tab_bar_animation.moving(now) or transition_active;
     const dirty = geometry_changed or items_changed or was_animating or self.tab_bar_animating or
@@ -8256,6 +8275,14 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
     var overlay_dirty = true;
     var tab_bar_dirty = true;
     const tab_bar_now = self.nowNs();
+    const transition_requested = self.tab_content_transition != null;
+    var content_transition = if (self.tab_content_transition) |transition| frame: {
+        if (frozen) break :frame null;
+        const bar = tabBarRect(self.layout, self.tab_bar_height, self.config.tab_bar_position);
+        const bar_height = if (bar) |rect| rect.height else 0;
+        const top = if (self.config.tab_bar_position == .top) bar_height else 0;
+        break :frame transition.frame(tab_bar_now, self.layout.surface_width, top, self.layout.surface_height - bar_height);
+    } else null;
     var scroll: ?ScrollDetector.Scroll = null;
     var old_cursor: vt.RenderState.Cursor = self.render_state.cursor;
     if (!frozen) {
@@ -8272,7 +8299,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         // Detection must precede update(). Both the previous and next frame
         // must be free of overlays because their pixels do not move with
         // terminal rows.
-        if (!self.async_force_full and self.scroll_offset == 0 and self.render_scroll_offset == 0 and
+        if (!self.async_force_full and !transition_requested and self.scroll_offset == 0 and self.render_scroll_offset == 0 and
             !hyperlink_hints and !self.async_job.hyperlink_hints and
             self.ime_preedit == null and self.async_job.preedit == null and
             self.async_job.link_hint == null and
@@ -8374,6 +8401,8 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         if (kitty_changed or (has_kitty_graphics and self.render_state.dirty != .false)) {
             self.render_state.dirty = .full;
         }
+        // Transition frames and the settled frame replace the entire terminal area.
+        if (transition_requested) self.render_state.dirty = .full;
         overlay_dirty = overlay_dirty or kitty_changed;
         const new_cursor_overlay = self.cursorOverlay();
         if (!std.meta.eql(self.async_job.cursor_overlay, new_cursor_overlay))
@@ -8415,6 +8444,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         return .deferred;
     };
     errdefer self.cancelFrameTarget(target.frame);
+    if (content_transition != null and self.tab_content_transition.?.start == null and !self.hasTabTransitionSource(target)) content_transition = null;
     if (scroll != null and target.age != 1 and target.source_pixels == null) scroll = null;
     if (scroll) |value| self.scroll_detector.prepare(&self.render_state, value, old_cursor);
     const repair: AsyncRaster.Repair = if (scroll == null)
@@ -8467,6 +8497,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         .tab_bar_position = self.config.tab_bar_position,
         .tab_bar_colors = self.config.effectiveTabBarColors(self.color_scheme),
         .tab_bar_dirty = tab_bar_dirty,
+        .tab_content_transition = content_transition,
         .kitty_items = self.async_job.kitty,
         .cursor_overlay = self.async_job.cursor_overlay,
         .overlay_dirty = overlay_dirty,
@@ -8480,6 +8511,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         self.rasterFatal(err);
         return .deferred;
     };
+    if (content_transition == null) self.tab_content_transition = null;
     if (!frozen) self.tab().kitty_dirty_seen = self.tab().term.screens.active.kitty_images.dirty;
     if (!frozen) self.async_force_full = false;
     if (self.window.telemetry) |telemetry| telemetry.renderSubmitted(telemetry_start);
@@ -8514,7 +8546,7 @@ fn canCommitHeldFrame(self: *const App) bool {
 /// or a render target is already checked out.
 fn hasContentRedraw(self: *App) bool {
     // Compositor frame callbacks pace animations even on an idle terminal.
-    const animate = !self.window.frame_pending and (self.cursor_anim_moving or self.tab_bar_animating);
+    const animate = !self.window.frame_pending and (self.cursor_anim_moving or self.tab_bar_animating or self.tab_content_transition != null);
     if (!self.needs_redraw and !animate) return false;
     // DEC 2026 freezes content frames, but geometry changes still
     // repaint (the frozen snapshot at the new size).
@@ -8554,7 +8586,7 @@ fn commitHeldFrame(self: *App) void {
     if (size.width != Window.physicalDimension(self.window.width, self.window.scale120) or
         size.height != Window.physicalDimension(self.window.height, self.window.scale120))
     {
-        self.cancelFrameTarget(frame);
+        self.discardFrameTarget(frame);
         self.frame_damage.invalidate();
         self.async_force_full = true;
         self.needs_redraw = true;
@@ -8591,7 +8623,11 @@ fn commitFinishedFrame(self: *App, frame: FrameTarget) void {
         if (frame == .shm) self.cancelFrameTarget(frame);
         self.window.fatal_error = err;
         self.window.running = false;
+        return;
     };
+    if (self.tab_content_transition) |*transition| {
+        if (transition.start == null) transition.start = self.nowNs();
+    }
 }
 
 /// A checked-out render target: a CPU shm buffer, or the Vulkan canvas.
@@ -8616,6 +8652,20 @@ const AcquiredTarget = struct {
     stride: u31,
     age: usize,
 };
+
+fn hasTabTransitionSource(self: *const App, target: AcquiredTarget) bool {
+    if (target.width != self.layout.surface_width or target.height != self.layout.surface_height) return false;
+    // A rapid switch can cancel a render that already overwrote the latest
+    // buffer or GPU canvas. Only use pixels that still match a committed frame.
+    return switch (target.frame) {
+        .shm => target.source_pixels != null,
+        .gpu => match: {
+            const canvas = self.vulkan.renderer.?.presentable();
+            break :match canvas.seq != 0 and canvas.seq == self.vulkan.committed_seq and
+                canvas.width == target.width and canvas.height == target.height;
+        },
+    };
+}
 
 fn acquireFrameTarget(self: *App) !AcquiredTarget {
     if (self.vulkan.renderer == null) {
@@ -8651,6 +8701,13 @@ fn cancelFrameTarget(self: *App, frame: FrameTarget) void {
     }
 }
 
+fn discardFrameTarget(self: *App, frame: FrameTarget) void {
+    switch (frame) {
+        .shm => |buffer| self.window.discardRender(buffer),
+        .gpu => self.window.cancelExternalRender(),
+    }
+}
+
 /// Copy the canvas into a swapchain image, covering everything that image
 /// missed, and present it with this frame's damage.
 fn presentVulkanFrame(self: *App, width: u31, height: u31, damage: Window.Damage) !void {
@@ -8663,7 +8720,8 @@ fn presentVulkanFrame(self: *App, width: u31, height: u31, damage: Window.Damage
         .rects => |rects| rects,
     };
     try presenter.copy(acquired, copy);
-    if (self.window.telemetry) |telemetry| telemetry.setGpuToken(self.vulkan.renderer.?.presentable().seq);
+    const seq = self.vulkan.renderer.?.presentable().seq;
+    if (self.window.telemetry) |telemetry| telemetry.setGpuToken(seq);
     // The swapchain commits the surface; queue the state that commit carries.
     try self.window.beginExternalCommit(width, height);
     try presenter.present(acquired, switch (damage) {
@@ -8671,6 +8729,7 @@ fn presentVulkanFrame(self: *App, width: u31, height: u31, damage: Window.Damage
         .rects => |rects| rects,
     });
     self.window.endExternalCommit();
+    self.vulkan.committed_seq = seq;
     if (self.vulkan.shm_leftover) self.vulkan.shm_leftover = self.window.releaseIdleBuffers();
 }
 
@@ -8721,6 +8780,7 @@ fn adoptVulkan(self: *App, renderer: *VulkanRenderer) void {
     };
     self.vulkan.renderer = renderer;
     self.vulkan.presenter = presenter;
+    self.tab_content_transition = null;
     if (self.window.telemetry) |telemetry| telemetry.gpu_time = .{ .ctx = renderer, .read = readVulkanGpuTime };
     self.vulkan.shm_leftover = self.window.buffers.items.len > 0;
     self.async_force_full = true;
@@ -8738,6 +8798,7 @@ const VulkanState = struct {
     pending: ?*VulkanRenderer = null,
     renderer: ?*VulkanRenderer = null,
     presenter: ?*VulkanPresenter = null,
+    committed_seq: u64 = 0,
     /// `vulkan-startup = wait`: draw nothing until the loader finishes.
     wait: bool = false,
     /// CPU shm buffers from before the switch are still alive.
@@ -8893,7 +8954,7 @@ fn finishAsyncRender(self: *App) void {
         result.job.width != Window.physicalDimension(self.window.width, self.window.scale120) or
         result.job.height != Window.physicalDimension(self.window.height, self.window.scale120))
     {
-        self.cancelFrameTarget(frame);
+        if (result.damage == .none) self.cancelFrameTarget(frame) else self.discardFrameTarget(frame);
         self.async_force_full = true;
         self.needs_redraw = true;
         return;
@@ -9239,7 +9300,7 @@ fn invalidateAsyncFrame(self: *App) void {
     // than commit outdated pixels on the next frame callback.
     if (self.held_frame) |frame| {
         self.held_frame = null;
-        self.cancelFrameTarget(frame);
+        self.discardFrameTarget(frame);
         self.frame_damage.invalidate();
         self.needs_redraw = true;
     }
@@ -9266,6 +9327,7 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
     self.layout = layout;
     if (!layout_changed and !self.terminalSizeStale()) return;
 
+    self.cancelTabContentTransition();
     self.stopFling();
     self.resetSmoothScroll();
     // A column change reflows the whole scrollback, which takes tens of
